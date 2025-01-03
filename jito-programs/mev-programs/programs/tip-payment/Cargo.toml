@@ -1,0 +1,23 @@
+[package]
+name = "jito-tip-payment"
+version = "0.1.5"
+description = "Tip Payment Program"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Jito Foundation <team@jito.network>"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "jito_tip_payment"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = { path = "../../../../anchor/lang" }
+default-env = "0.1.1"
+solana-security-txt = "1.1.1"

@@ -1,0 +1,30 @@
+{
+  "name": "pda-derivation",
+  "version": "0.24.2",
+  "license": "(MIT OR Apache-2.0)",
+  "homepage": "https://github.com/project-serum/anchor#readme",
+  "bugs": {
+    "url": "https://github.com/project-serum/anchor/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/project-serum/anchor.git"
+  },
+  "engines": {
+    "node": ">=11"
+  },
+  "scripts": {
+    "test": "anchor test"
+  },
+  "dependencies": {
+    "@project-serum/anchor": "file:../ts",
+    "@project-serum/serum": "^0.13.60",
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^9.1.0",
+    "@types/node": "^14.14.37",
+    "chai": "^4.3.4",
+    "mocha": "^9.1.3",
+    "prettier": "^2.5.1",
+    "typescript": "^4.4.4"
+  }
+}
