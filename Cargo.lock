@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "agave-accounts-hash-cache-tool"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytemuck",
  "clap 2.33.3",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "agave-cargo-registry"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "flate2",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "agave-geyser-plugin-interface"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "solana-sdk",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "agave-install"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "atty",
  "bincode",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "agave-ledger-tool"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_cmd",
  "bs58 0.5.1",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "agave-store-tool"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "solana-accounts-db",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "agave-validator"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "agave-geyser-plugin-interface",
  "chrono",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "agave-watchtower"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "humantime",
@@ -1333,9 +1333,9 @@ checksum = "5ce89b21cab1437276d2650d57e971f9d548a2d9037cc231abdc0562b97498ce"
 
 [[package]]
 name = "bytemuck"
-version = "1.16.1"
+version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b236fc92302c97ed75b38da1f4917b5cdda4984745740f153a5d3059e48d725e"
+checksum = "ef657dfab802224e671f5818e9a4935f9b1957ed18e58292690cc39e7a4092a3"
 dependencies = [
  "bytemuck_derive",
 ]
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "gen-headers"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "regex",
@@ -2639,7 +2639,7 @@ dependencies = [
 
 [[package]]
 name = "gen-syscall-list"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "regex",
 ]
@@ -3255,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "jito-protos"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytes",
  "prost",
@@ -3296,10 +3296,11 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.69"
+version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29c15563dc2726973df627357ce0c9ddddbea194836909d655df6a75d2cf296d"
+checksum = "6717b6b5b077764fb5966237269cb3c64edddde4b14ce42647430a78ced9e7b7"
 dependencies = [
+ "once_cell",
  "wasm-bindgen",
 ]
 
@@ -4166,6 +4167,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 
 [[package]]
+name = "paladin-lockup-program"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "num-derive",
+ "num-traits",
+ "rand 0.8.5",
+ "shank",
+ "solana-program",
+ "solana-program-test",
+ "solana-sdk",
+ "spl-associated-token-account",
+ "spl-discriminator",
+ "spl-token-2022",
+ "test-case",
+ "thiserror",
+]
+
+[[package]]
 name = "parity-tokio-ipc"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4654,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "protobuf-src",
  "tonic-build",
@@ -4915,7 +4935,7 @@ dependencies = [
 
 [[package]]
 name = "rbpf-cli"
-version = "2.0.19"
+version = "2.0.21"
 
 [[package]]
 name = "rdrand"
@@ -5620,6 +5640,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "shank"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23d894855493d4ce613b25550fe1ed1c62d0af5486b984579ba55e3f8c9631d5"
+dependencies = [
+ "shank_macro",
+]
+
+[[package]]
+name = "shank_macro"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9bf2645f8eebde043da69200195058e7b59806705104f908a31d05ca82844ce"
+dependencies = [
+ "proc-macro2 1.0.85",
+ "quote 1.0.36",
+ "shank_macro_impl",
+ "shank_render",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "shank_macro_impl"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93d0593f48acb0a722906416b1f6b8926f6571eb9af16d566a7c65427f269f50"
+dependencies = [
+ "anyhow",
+ "proc-macro2 1.0.85",
+ "quote 1.0.36",
+ "serde",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "shank_render"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "121175ba61809189f888dc5822ebfd30fa0d91e1e1f61d25a4d40b0847b3075e"
+dependencies = [
+ "proc-macro2 1.0.85",
+ "quote 1.0.36",
+ "shank_macro_impl",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5771,7 +5837,7 @@ dependencies = [
 
 [[package]]
 name = "solana-account-decoder"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "Inflector",
  "assert_matches",
@@ -5796,7 +5862,7 @@ dependencies = [
 
 [[package]]
 name = "solana-accounts-bench"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "log",
@@ -5810,7 +5876,7 @@ dependencies = [
 
 [[package]]
 name = "solana-accounts-cluster-bench"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "log",
@@ -5841,7 +5907,7 @@ dependencies = [
 
 [[package]]
 name = "solana-accounts-db"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -5902,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "solana-address-lookup-table-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "bytemuck",
@@ -5918,7 +5984,7 @@ dependencies = [
 
 [[package]]
 name = "solana-address-lookup-table-program-tests"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -5929,7 +5995,7 @@ dependencies = [
 
 [[package]]
 name = "solana-banking-bench"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 3.2.23",
  "crossbeam-channel",
@@ -5954,7 +6020,7 @@ dependencies = [
 
 [[package]]
 name = "solana-banks-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "borsh 1.5.1",
  "futures 0.3.30",
@@ -5971,7 +6037,7 @@ dependencies = [
 
 [[package]]
 name = "solana-banks-interface"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "serde",
  "serde_derive",
@@ -5981,7 +6047,7 @@ dependencies = [
 
 [[package]]
 name = "solana-banks-server"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "crossbeam-channel",
@@ -6000,7 +6066,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bench-streamer"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 3.2.23",
  "crossbeam-channel",
@@ -6011,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bench-tps"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "chrono",
  "clap 2.33.3",
@@ -6057,7 +6123,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bloom"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bv",
  "fnv",
@@ -6074,7 +6140,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bpf-loader-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -6099,7 +6165,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bpf-loader-program-tests"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -6110,7 +6176,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bucket-map"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bv",
  "bytemuck",
@@ -6130,7 +6196,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bundle"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anchor-lang",
  "assert_matches",
@@ -6153,7 +6219,7 @@ dependencies = [
 
 [[package]]
 name = "solana-cargo-build-bpf"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "solana-logger",
@@ -6161,7 +6227,7 @@ dependencies = [
 
 [[package]]
 name = "solana-cargo-build-sbf"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_cmd",
  "bzip2",
@@ -6182,11 +6248,11 @@ dependencies = [
 
 [[package]]
 name = "solana-cargo-test-bpf"
-version = "2.0.19"
+version = "2.0.21"
 
 [[package]]
 name = "solana-cargo-test-sbf"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "cargo_metadata",
  "clap 3.2.23",
@@ -6198,7 +6264,7 @@ dependencies = [
 
 [[package]]
 name = "solana-clap-utils"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "chrono",
@@ -6215,7 +6281,7 @@ dependencies = [
 
 [[package]]
 name = "solana-clap-v3-utils"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "chrono",
@@ -6233,7 +6299,7 @@ dependencies = [
 
 [[package]]
 name = "solana-cli"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -6292,7 +6358,7 @@ dependencies = [
 
 [[package]]
 name = "solana-cli-config"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anyhow",
  "dirs-next",
@@ -6307,7 +6373,7 @@ dependencies = [
 
 [[package]]
 name = "solana-cli-output"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "Inflector",
  "base64 0.22.1",
@@ -6333,7 +6399,7 @@ dependencies = [
 
 [[package]]
 name = "solana-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "async-trait",
  "bincode",
@@ -6365,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "solana-client-test"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "futures-util",
  "rand 0.8.5",
@@ -6395,7 +6461,7 @@ dependencies = [
 
 [[package]]
 name = "solana-compute-budget"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "rustc_version 0.4.0",
  "solana-frozen-abi",
@@ -6404,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "solana-compute-budget-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "solana-program-runtime",
  "solana-sdk",
@@ -6412,7 +6478,7 @@ dependencies = [
 
 [[package]]
 name = "solana-config-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "chrono",
@@ -6425,7 +6491,7 @@ dependencies = [
 
 [[package]]
 name = "solana-connection-cache"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "async-trait",
  "bincode",
@@ -6448,7 +6514,7 @@ dependencies = [
 
 [[package]]
 name = "solana-core"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "ahash 0.8.10",
  "anchor-lang",
@@ -6456,6 +6522,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "bs58 0.5.1",
+ "bytemuck",
  "bytes",
  "chrono",
  "crossbeam-channel",
@@ -6475,6 +6542,7 @@ dependencies = [
  "min-max-heap",
  "num_enum",
  "ouroboros",
+ "paladin-lockup-program",
  "prio-graph",
  "prost",
  "prost-types",
@@ -6532,6 +6600,7 @@ dependencies = [
  "solana-vote",
  "solana-vote-program",
  "solana-wen-restart",
+ "spl-discriminator",
  "static_assertions",
  "strum",
  "strum_macros",
@@ -6550,7 +6619,7 @@ dependencies = [
 
 [[package]]
 name = "solana-cost-model"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "ahash 0.8.10",
  "itertools 0.12.1",
@@ -6577,7 +6646,7 @@ dependencies = [
 
 [[package]]
 name = "solana-curve25519"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytemuck",
  "bytemuck_derive",
@@ -6588,7 +6657,7 @@ dependencies = [
 
 [[package]]
 name = "solana-dos"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "clap 3.2.23",
@@ -6621,7 +6690,7 @@ dependencies = [
 
 [[package]]
 name = "solana-download-utils"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "console",
  "indicatif",
@@ -6633,7 +6702,7 @@ dependencies = [
 
 [[package]]
 name = "solana-ed25519-program-tests"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "ed25519-dalek",
@@ -6644,7 +6713,7 @@ dependencies = [
 
 [[package]]
 name = "solana-entry"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -6666,7 +6735,7 @@ dependencies = [
 
 [[package]]
 name = "solana-faucet"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "byteorder",
@@ -6688,7 +6757,7 @@ dependencies = [
 
 [[package]]
 name = "solana-frozen-abi"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bitflags 2.5.0",
  "bs58 0.5.1",
@@ -6709,7 +6778,7 @@ dependencies = [
 
 [[package]]
 name = "solana-frozen-abi-macro"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "proc-macro2 1.0.85",
  "quote 1.0.36",
@@ -6719,7 +6788,7 @@ dependencies = [
 
 [[package]]
 name = "solana-genesis"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -6744,7 +6813,7 @@ dependencies = [
 
 [[package]]
 name = "solana-genesis-utils"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "solana-accounts-db",
@@ -6755,7 +6824,7 @@ dependencies = [
 
 [[package]]
 name = "solana-geyser-plugin-manager"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "agave-geyser-plugin-interface",
  "bs58 0.5.1",
@@ -6780,7 +6849,7 @@ dependencies = [
 
 [[package]]
 name = "solana-gossip"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -6831,7 +6900,7 @@ dependencies = [
 
 [[package]]
 name = "solana-inline-spl"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytemuck",
  "rustc_version 0.4.0",
@@ -6840,7 +6909,7 @@ dependencies = [
 
 [[package]]
 name = "solana-keygen"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bs58 0.5.1",
  "clap 3.2.23",
@@ -6857,7 +6926,7 @@ dependencies = [
 
 [[package]]
 name = "solana-ledger"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -6930,7 +6999,7 @@ dependencies = [
 
 [[package]]
 name = "solana-loader-v4-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "log",
@@ -6944,7 +7013,7 @@ dependencies = [
 
 [[package]]
 name = "solana-local-cluster"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "crossbeam-channel",
@@ -6985,7 +7054,7 @@ dependencies = [
 
 [[package]]
 name = "solana-log-analyzer"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "byte-unit",
  "clap 3.2.23",
@@ -6997,7 +7066,7 @@ dependencies = [
 
 [[package]]
 name = "solana-logger"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "env_logger",
  "lazy_static",
@@ -7006,7 +7075,7 @@ dependencies = [
 
 [[package]]
 name = "solana-measure"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "solana-sdk",
@@ -7014,11 +7083,11 @@ dependencies = [
 
 [[package]]
 name = "solana-memory-management"
-version = "2.0.19"
+version = "2.0.21"
 
 [[package]]
 name = "solana-merkle-root-bench"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "log",
@@ -7031,7 +7100,7 @@ dependencies = [
 
 [[package]]
 name = "solana-merkle-tree"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "fast-math",
  "hex",
@@ -7040,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "solana-metrics"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "crossbeam-channel",
  "env_logger",
@@ -7056,7 +7125,7 @@ dependencies = [
 
 [[package]]
 name = "solana-net-shaper"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 3.2.23",
  "rand 0.8.5",
@@ -7068,7 +7137,7 @@ dependencies = [
 
 [[package]]
 name = "solana-net-utils"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "clap 3.2.23",
@@ -7095,7 +7164,7 @@ checksum = "8b8a731ed60e89177c8a7ab05fe0f1511cedd3e70e773f288f9de33a9cfdc21e"
 
 [[package]]
 name = "solana-notifier"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "reqwest",
@@ -7105,7 +7174,7 @@ dependencies = [
 
 [[package]]
 name = "solana-package-metadata-macro"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "proc-macro2 1.0.85",
  "quote 1.0.36",
@@ -7115,7 +7184,7 @@ dependencies = [
 
 [[package]]
 name = "solana-perf"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "ahash 0.8.10",
  "assert_matches",
@@ -7146,7 +7215,7 @@ dependencies = [
 
 [[package]]
 name = "solana-poh"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -7168,7 +7237,7 @@ dependencies = [
 
 [[package]]
 name = "solana-poh-bench"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 3.2.23",
  "log",
@@ -7184,7 +7253,7 @@ dependencies = [
 
 [[package]]
 name = "solana-poseidon"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "ark-bn254",
  "light-poseidon",
@@ -7193,7 +7262,7 @@ dependencies = [
 
 [[package]]
 name = "solana-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -7248,7 +7317,7 @@ dependencies = [
 
 [[package]]
 name = "solana-program-runtime"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "base64 0.22.1",
@@ -7280,7 +7349,7 @@ dependencies = [
 
 [[package]]
 name = "solana-program-test"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7312,7 +7381,7 @@ dependencies = [
 
 [[package]]
 name = "solana-pubsub-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -7336,7 +7405,7 @@ dependencies = [
 
 [[package]]
 name = "solana-quic-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "async-mutex",
  "async-trait",
@@ -7363,7 +7432,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rayon-threadlimit"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "lazy_static",
  "num_cpus",
@@ -7371,7 +7440,7 @@ dependencies = [
 
 [[package]]
 name = "solana-remote-wallet"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "console",
@@ -7390,7 +7459,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -7453,7 +7522,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7483,7 +7552,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-client-api"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7508,7 +7577,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-client-nonce-utils"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anyhow",
  "clap 2.33.3",
@@ -7525,7 +7594,7 @@ dependencies = [
 
 [[package]]
 name = "solana-rpc-test"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "bs58 0.5.1",
@@ -7553,7 +7622,7 @@ dependencies = [
 
 [[package]]
 name = "solana-runtime"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "aquamarine",
  "arrayref",
@@ -7641,7 +7710,7 @@ dependencies = [
 
 [[package]]
 name = "solana-runtime-plugin"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "crossbeam-channel",
  "json5",
@@ -7659,7 +7728,7 @@ dependencies = [
 
 [[package]]
 name = "solana-runtime-transaction"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "log",
@@ -7673,7 +7742,7 @@ dependencies = [
 
 [[package]]
 name = "solana-sdk"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anchor-lang",
  "anyhow",
@@ -7733,7 +7802,7 @@ dependencies = [
 
 [[package]]
 name = "solana-sdk-macro"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bs58 0.5.1",
  "proc-macro2 1.0.85",
@@ -7750,7 +7819,7 @@ checksum = "468aa43b7edb1f9b7b7b686d5c3aeb6630dc1708e86e31343499dd5c4d775183"
 
 [[package]]
 name = "solana-send-transaction-service"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -7768,7 +7837,7 @@ dependencies = [
 
 [[package]]
 name = "solana-stake-accounts"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "clap 2.33.3",
  "solana-clap-utils",
@@ -7784,7 +7853,7 @@ dependencies = [
 
 [[package]]
 name = "solana-stake-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -7803,7 +7872,7 @@ dependencies = [
 
 [[package]]
 name = "solana-stake-program-tests"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -7816,7 +7885,7 @@ dependencies = [
 
 [[package]]
 name = "solana-storage-bigtable"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "backoff",
  "bincode",
@@ -7848,7 +7917,7 @@ dependencies = [
 
 [[package]]
 name = "solana-storage-proto"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "bs58 0.5.1",
@@ -7864,7 +7933,7 @@ dependencies = [
 
 [[package]]
 name = "solana-streamer"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "async-channel",
@@ -7898,7 +7967,7 @@ dependencies = [
 
 [[package]]
 name = "solana-svm"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "itertools 0.12.1",
@@ -7933,7 +8002,7 @@ dependencies = [
 
 [[package]]
 name = "solana-system-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -7949,7 +8018,7 @@ dependencies = [
 
 [[package]]
 name = "solana-test-validator"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -7979,7 +8048,7 @@ dependencies = [
 
 [[package]]
 name = "solana-thin-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "log",
@@ -7993,7 +8062,7 @@ dependencies = [
 
 [[package]]
 name = "solana-tip-distributor"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anchor-lang",
  "clap 4.3.21",
@@ -8031,7 +8100,7 @@ dependencies = [
 
 [[package]]
 name = "solana-tokens"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -8065,7 +8134,7 @@ dependencies = [
 
 [[package]]
 name = "solana-tps-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "serial_test",
@@ -8086,7 +8155,7 @@ dependencies = [
 
 [[package]]
 name = "solana-tpu-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "async-trait",
  "bincode",
@@ -8108,7 +8177,7 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction-dos"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "clap 2.33.3",
@@ -8135,7 +8204,7 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction-metrics-tracker"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "Inflector",
  "base64 0.22.1",
@@ -8149,7 +8218,7 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction-status"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "Inflector",
  "base64 0.22.1",
@@ -8174,7 +8243,7 @@ dependencies = [
 
 [[package]]
 name = "solana-turbine"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -8212,7 +8281,7 @@ dependencies = [
 
 [[package]]
 name = "solana-type-overrides"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "futures 0.3.30",
  "lazy_static",
@@ -8222,7 +8291,7 @@ dependencies = [
 
 [[package]]
 name = "solana-udp-client"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "async-trait",
  "solana-connection-cache",
@@ -8235,7 +8304,7 @@ dependencies = [
 
 [[package]]
 name = "solana-unified-scheduler-logic"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "solana-sdk",
@@ -8244,7 +8313,7 @@ dependencies = [
 
 [[package]]
 name = "solana-unified-scheduler-pool"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "crossbeam-channel",
@@ -8265,7 +8334,7 @@ dependencies = [
 
 [[package]]
 name = "solana-upload-perf"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "serde_json",
  "solana-metrics",
@@ -8273,7 +8342,7 @@ dependencies = [
 
 [[package]]
 name = "solana-version"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "log",
  "rustc_version 0.4.0",
@@ -8287,7 +8356,7 @@ dependencies = [
 
 [[package]]
 name = "solana-vote"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bincode",
  "itertools 0.12.1",
@@ -8304,7 +8373,7 @@ dependencies = [
 
 [[package]]
 name = "solana-vote-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "assert_matches",
  "bincode",
@@ -8327,7 +8396,7 @@ dependencies = [
 
 [[package]]
 name = "solana-wen-restart"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -8356,7 +8425,7 @@ dependencies = [
 
 [[package]]
 name = "solana-zk-elgamal-proof-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytemuck",
  "num-derive",
@@ -8368,7 +8437,7 @@ dependencies = [
 
 [[package]]
 name = "solana-zk-keygen"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bs58 0.5.1",
  "clap 3.2.23",
@@ -8387,7 +8456,7 @@ dependencies = [
 
 [[package]]
 name = "solana-zk-sdk"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "aes-gcm-siv",
  "base64 0.22.1",
@@ -8415,7 +8484,7 @@ dependencies = [
 
 [[package]]
 name = "solana-zk-token-proof-program"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -8429,7 +8498,7 @@ dependencies = [
 
 [[package]]
 name = "solana-zk-token-proof-program-tests"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "bytemuck",
  "curve25519-dalek",
@@ -8441,7 +8510,7 @@ dependencies = [
 
 [[package]]
 name = "solana-zk-token-sdk"
-version = "2.0.19"
+version = "2.0.21"
 dependencies = [
  "aes-gcm-siv",
  "base64 0.22.1",
@@ -9749,23 +9818,23 @@ checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.92"
+version = "0.2.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4be2531df63900aeb2bca0daaaddec08491ee64ceecbee5076636a3b026795a8"
+checksum = "a474f6281d1d70c17ae7aa6a613c87fce69a127e2624002df63dcb39d6cf6396"
 dependencies = [
  "cfg-if 1.0.0",
+ "once_cell",
  "wasm-bindgen-macro",
 ]
 
 [[package]]
 name = "wasm-bindgen-backend"
-version = "0.2.92"
+version = "0.2.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "614d787b966d3989fa7bb98a654e369c762374fd3213d212cfc0251257e747da"
+checksum = "5f89bb38646b4f81674e8f5c3fb81b562be1fd936d84320f3264486418519c79"
 dependencies = [
  "bumpalo",
  "log",
- "once_cell",
  "proc-macro2 1.0.85",
  "quote 1.0.36",
  "syn 2.0.66",
@@ -9786,9 +9855,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.92"
+version = "0.2.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1f8823de937b71b9460c0c34e25f3da88250760bec0ebac694b49997550d726"
+checksum = "2cc6181fd9a7492eef6fef1f33961e3695e4579b9872a6f7c83aee556666d4fe"
 dependencies = [
  "quote 1.0.36",
  "wasm-bindgen-macro-support",
@@ -9796,9 +9865,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.92"
+version = "0.2.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e94f17b526d0a461a191c78ea52bbce64071ed5c04c9ffe424dcb38f74171bb7"
+checksum = "30d7a95b763d3c45903ed6c81f156801839e5ee968bb07e534c44df0fcd330c2"
 dependencies = [
  "proc-macro2 1.0.85",
  "quote 1.0.36",
@@ -9809,9 +9878,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.92"
+version = "0.2.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af190c94f2773fdb3729c55b007a722abb5384da03bc0986df4c289bf5567e96"
+checksum = "943aab3fdaaa029a6e0271b35ea10b72b943135afe9bffca82384098ad0e06a6"
 
 [[package]]
 name = "web-sys"

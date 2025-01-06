@@ -14,7 +14,6 @@ use {
         fetch_stage::FetchStage,
         p3::P3,
         paladin_bundle_stage::PaladinBundleStage,
-        paladin_socket::PaladinSocket,
         proxy::{
             block_engine_stage::{BlockBuilderFeeInfo, BlockEngineConfig, BlockEngineStage},
             fetch_stage_manager::FetchStageManager,
@@ -96,7 +95,6 @@ pub struct Tpu {
     block_engine_stage: BlockEngineStage,
     fetch_stage_manager: FetchStageManager,
     jito_bundle_stage: BundleStage,
-    paladin_socket: std::thread::JoinHandle<()>,
     paladin_bundle_stage: std::thread::JoinHandle<()>,
     p3: std::thread::JoinHandle<()>,
 }
@@ -269,8 +267,12 @@ impl Tpu {
 
         // Launch paladin threads.
         let (paladin_sender, paladin_receiver) = unbounded();
-        let paladin_socket = PaladinSocket::spawn(exit.clone(), paladin_sender.clone());
-        let p3 = P3::spawn(exit.clone(), paladin_sender, p3_socket);
+        let p3 = P3::spawn(
+            exit.clone(),
+            paladin_sender,
+            p3_socket,
+            poh_recorder.clone(),
+        );
 
         let (heartbeat_tx, heartbeat_rx) = unbounded();
         let fetch_stage_manager = FetchStageManager::new(
@@ -401,7 +403,6 @@ impl Tpu {
                 staked_nodes_updater_service,
                 tracer_thread_hdl,
                 block_engine_stage,
-                paladin_socket,
                 relayer_stage,
                 fetch_stage_manager,
                 jito_bundle_stage,
@@ -426,7 +427,6 @@ impl Tpu {
             self.relayer_stage.join(),
             self.block_engine_stage.join(),
             self.fetch_stage_manager.join(),
-            self.paladin_socket.join(),
             self.paladin_bundle_stage.join(),
             self.p3.join(),
         ];

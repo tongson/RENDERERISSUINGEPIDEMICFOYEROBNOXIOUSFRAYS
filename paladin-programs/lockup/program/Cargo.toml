@@ -1,0 +1,33 @@
+[package]
+name = "paladin-lockup-program"
+version = "0.0.1"
+description = "Paladin Lockup Program"
+readme = "../README.md"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+bytemuck = { workspace = true, features = ["derive"] }
+num-derive = { workspace = true }
+num-traits = { workspace = true }
+shank = { workspace = true }
+solana-program = { workspace = true }
+spl-associated-token-account = { workspace = true, features = ["no-entrypoint"] }
+spl-discriminator = { workspace = true }
+spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+solana-program-test = { workspace = true }
+solana-sdk = { workspace = true }
+test-case = { workspace = true }
+
+[features]
+bpf-entrypoint = []
+test-sbf = []
+
+[package.metadata.solana]
+program-id = "2fzrtg7ckXTFxjgsXbAWLLvXr4wJK9xfUjJJ69uZ7chb"
