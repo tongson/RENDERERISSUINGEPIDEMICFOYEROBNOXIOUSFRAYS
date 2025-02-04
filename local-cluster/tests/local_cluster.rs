@@ -3,8 +3,9 @@ use {
     assert_matches::assert_matches,
     crossbeam_channel::{unbounded, Receiver},
     gag::BufferRedirect,
+    itertools::Itertools,
     log::*,
-    rand::seq::IteratorRandom,
+    rand::seq::SliceRandom,
     serial_test::serial,
     solana_accounts_db::{
         hardened_unpack::open_genesis_config, utils::create_accounts_run_and_snapshot_dirs,
@@ -64,7 +65,9 @@ use {
         client::AsyncClient,
         clock::{self, Slot, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE},
         commitment_config::CommitmentConfig,
-        epoch_schedule::{DEFAULT_SLOTS_PER_EPOCH, MINIMUM_SLOTS_PER_EPOCH},
+        epoch_schedule::{
+            DEFAULT_SLOTS_PER_EPOCH, MAX_LEADER_SCHEDULE_EPOCH_OFFSET, MINIMUM_SLOTS_PER_EPOCH,
+        },
         genesis_config::ClusterType,
         hard_forks::HardForks,
         hash::Hash,
@@ -74,6 +77,7 @@ use {
         system_program, system_transaction,
         vote::state::TowerSync,
     },
+    solana_stake_program::stake_state::NEW_WARMUP_COOLDOWN_RATE,
     solana_streamer::socket::SocketAddrSpace,
     solana_turbine::broadcast_stage::{
         broadcast_duplicates_run::{BroadcastDuplicatesConfig, ClusterPartition},
@@ -94,6 +98,7 @@ use {
         thread::{sleep, Builder, JoinHandle},
         time::{Duration, Instant},
     },
+    strum::{EnumCount, IntoEnumIterator},
 };
 
 #[test]
@@ -1542,20 +1547,47 @@ fn test_wait_for_max_stake() {
     solana_logger::setup_with_default(RUST_LOG_FILTER);
     let validator_config = ValidatorConfig::default_for_test();
     let slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH;
+    // Set this large enough to allow for skipped slots but still be able to
+    // make a root and derive the new leader schedule in time.
+    let stakers_slot_offset = slots_per_epoch.saturating_mul(MAX_LEADER_SCHEDULE_EPOCH_OFFSET);
+    // Reduce this so that we can complete the test faster by advancing through
+    // slots/epochs faster. But don't make it too small because it can make us
+    // susceptible to skipped slots and the cluster getting stuck.
+    let ticks_per_slot = 16;
+    let num_validators = 4;
     let mut config = ClusterConfig {
         cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
-        node_stakes: vec![DEFAULT_NODE_STAKE; 4],
-        validator_configs: make_identical_validator_configs(&validator_config, 4),
+        node_stakes: vec![DEFAULT_NODE_STAKE; num_validators],
+        validator_configs: make_identical_validator_configs(&validator_config, num_validators),
         slots_per_epoch,
-        stakers_slot_offset: slots_per_epoch,
+        stakers_slot_offset,
+        ticks_per_slot,
         ..ClusterConfig::default()
     };
     let cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
     let client = RpcClient::new_socket(cluster.entry_point_info.rpc().unwrap());
 
-    assert!(client
-        .wait_for_max_stake(CommitmentConfig::default(), 33.0f32)
-        .is_ok());
+    let num_validators_activating_stake = num_validators - 1;
+    // Number of epochs it is expected to take to completely activate the stake
+    // for all the validators.
+    let num_expected_epochs = (num_validators_activating_stake as f64)
+        .log(1. + NEW_WARMUP_COOLDOWN_RATE)
+        .ceil() as u32
+        + 1;
+    let expected_test_duration = config.poh_config.target_tick_duration
+        * ticks_per_slot as u32
+        * slots_per_epoch as u32
+        * num_expected_epochs;
+    // Make the timeout double the expected duration to provide some margin.
+    // Especially considering tests may be running in parallel.
+    let timeout = expected_test_duration * 2;
+    if let Err(err) = client.wait_for_max_stake_below_threshold_with_timeout(
+        CommitmentConfig::default(),
+        (100 / num_validators_activating_stake) as f32,
+        timeout,
+    ) {
+        panic!("wait_for_max_stake failed: {:?}", err);
+    }
     assert!(client.get_slot().unwrap() > 10);
 }
 
@@ -2705,12 +2737,11 @@ fn test_oc_bad_signatures() {
                 // Add all recent vote slots on this fork to allow cluster to pass
                 // vote threshold checks in replay. Note this will instantly force a
                 // root by this validator.
-                let vote_slots: Vec<Slot> = vec![vote_slot];
+                let tower_sync = TowerSync::new_from_slots(vec![vote_slot], vote_hash, None);
 
                 let bad_authorized_signer_keypair = Keypair::new();
-                let mut vote_tx = vote_transaction::new_vote_transaction(
-                    vote_slots,
-                    vote_hash,
+                let mut vote_tx = vote_transaction::new_tower_sync_transaction(
+                    tower_sync,
                     leader_vote_tx.message.recent_blockhash,
                     &node_keypair,
                     &vote_keypair,
@@ -4621,6 +4652,7 @@ fn test_slot_hash_expiry() {
 //
 #[test]
 #[serial]
+#[ignore]
 fn test_duplicate_with_pruned_ancestor() {
     solana_logger::setup_with("info,solana_metrics=off");
     solana_core::repair::duplicate_repair_status::set_ancestor_hash_repair_sample_size_for_tests_only(3);
@@ -4889,7 +4921,7 @@ fn test_duplicate_with_pruned_ancestor() {
 #[test]
 #[serial]
 fn test_boot_from_local_state() {
-    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    solana_logger::setup_with_default("error,local_cluster=info");
     const FULL_SNAPSHOT_INTERVAL: Slot = 100;
     const INCREMENTAL_SNAPSHOT_INTERVAL: Slot = 10;
 
@@ -4966,24 +4998,11 @@ fn test_boot_from_local_state() {
     info!("Waiting for validator2 to create a new bank snapshot...");
     let timer = Instant::now();
     let bank_snapshot = loop {
-        if let Some(full_snapshot_slot) = snapshot_utils::get_highest_full_snapshot_archive_slot(
-            &validator2_config.full_snapshot_archives_dir,
-            None,
-        ) {
-            if let Some(incremental_snapshot_slot) =
-                snapshot_utils::get_highest_incremental_snapshot_archive_slot(
-                    &validator2_config.incremental_snapshot_archives_dir,
-                    full_snapshot_slot,
-                    None,
-                )
-            {
-                if let Some(bank_snapshot) = snapshot_utils::get_highest_bank_snapshot_post(
-                    &validator2_config.bank_snapshots_dir,
-                ) {
-                    if bank_snapshot.slot > incremental_snapshot_slot {
-                        break bank_snapshot;
-                    }
-                }
+        if let Some(bank_snapshot) =
+            snapshot_utils::get_highest_bank_snapshot_post(&validator2_config.bank_snapshots_dir)
+        {
+            if bank_snapshot.slot > incremental_snapshot_archive.slot() {
+                break bank_snapshot;
             }
         }
         assert!(
@@ -5059,16 +5078,40 @@ fn test_boot_from_local_state() {
     debug!("snapshot archives:\n\tfull: {full_snapshot_archive:?}\n\tincr: {incremental_snapshot_archive:?}");
     info!("Waiting for validator3 to create snapshots... DONE");
 
-    // ensure that all validators have the correct state by comparing snapshots
+    // Ensure that all validators have the correct state by comparing snapshots.
+    // Since validator1 has been running the longest, if may be ahead of the others,
+    // so use it as the comparison for others.
+    // - wait for validator1 to take new snapshots
     // - wait for the other validators to have high enough snapshots
-    // - ensure validator3's snapshot hashes match the other validators' snapshot hashes
+    // - ensure the other validators' snapshots match validator1's
     //
-    // NOTE: There's a chance validator's 1 or 2 have crossed the next full snapshot past what
-    // validator 3 has.  If that happens, validator's 1 or 2 may have purged the snapshots needed
-    // to compare with validator 3, and thus assert.  If that happens, the full snapshot interval
+    // NOTE: There's a chance validator 2 or 3 has crossed the next full snapshot past what
+    // validator 1 has.  If that happens, validator 2 or 3 may have purged the snapshots needed
+    // to compare with validator 1, and thus assert.  If that happens, the full snapshot interval
     // may need to be adjusted larger.
-    for (i, other_validator_config) in [(1, &validator1_config), (2, &validator2_config)] {
-        info!("Checking if validator{i} has the same snapshots as validator3...");
+
+    info!("Waiting for validator1 to create snapshots...");
+    let (incremental_snapshot_archive, full_snapshot_archive) =
+        LocalCluster::wait_for_next_incremental_snapshot(
+            &cluster,
+            &validator1_config.full_snapshot_archives_dir,
+            &validator1_config.incremental_snapshot_archives_dir,
+            Some(Duration::from_secs(5 * 60)),
+        );
+    debug!("snapshot archives:\n\tfull: {full_snapshot_archive:?}\n\tincr: {incremental_snapshot_archive:?}");
+    info!("Waiting for validator1 to create snapshots... DONE");
+
+    // These structs are used to provide better error logs if the asserts below are violated.
+    // The `allow(dead_code)` annotation is to appease clippy, which thinks the field is unused...
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct SnapshotSlot(Slot);
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct BaseSlot(Slot);
+
+    for (i, other_validator_config) in [(2, &validator2_config), (3, &validator3_config)] {
+        info!("Checking if validator{i} has the same snapshots as validator1...");
         let timer = Instant::now();
         loop {
             if let Some(other_full_snapshot_slot) =
@@ -5091,7 +5134,7 @@ fn test_boot_from_local_state() {
             }
             assert!(
                 timer.elapsed() < Duration::from_secs(60),
-                "It should not take longer than 60 seconds to take snapshots"
+                "It should not take longer than 60 seconds to take snapshots",
             );
             std::thread::yield_now();
         }
@@ -5099,13 +5142,26 @@ fn test_boot_from_local_state() {
             &other_validator_config.full_snapshot_archives_dir,
         );
         debug!("validator{i} full snapshot archives: {other_full_snapshot_archives:?}");
-        assert!(other_full_snapshot_archives
-            .iter()
-            .any(
-                |other_full_snapshot_archive| other_full_snapshot_archive.slot()
-                    == full_snapshot_archive.slot()
-                    && other_full_snapshot_archive.hash() == full_snapshot_archive.hash()
-            ));
+        assert!(
+            other_full_snapshot_archives
+                .iter()
+                .any(
+                    |other_full_snapshot_archive| other_full_snapshot_archive.slot()
+                        == full_snapshot_archive.slot()
+                        && other_full_snapshot_archive.hash() == full_snapshot_archive.hash()
+                ),
+            "full snapshot archive does not match!\n  validator1: {:?}\n  validator{i}: {:?}",
+            (
+                SnapshotSlot(full_snapshot_archive.slot()),
+                full_snapshot_archive.hash(),
+            ),
+            other_full_snapshot_archives
+                .iter()
+                .sorted_unstable()
+                .rev()
+                .map(|snap| (SnapshotSlot(snap.slot()), snap.hash()))
+                .collect::<Vec<_>>(),
+        );
 
         let other_incremental_snapshot_archives = snapshot_utils::get_incremental_snapshot_archives(
             &other_validator_config.incremental_snapshot_archives_dir,
@@ -5113,13 +5169,36 @@ fn test_boot_from_local_state() {
         debug!(
             "validator{i} incremental snapshot archives: {other_incremental_snapshot_archives:?}"
         );
-        assert!(other_incremental_snapshot_archives.iter().any(
-            |other_incremental_snapshot_archive| other_incremental_snapshot_archive.base_slot()
-                == incremental_snapshot_archive.base_slot()
-                && other_incremental_snapshot_archive.slot() == incremental_snapshot_archive.slot()
-                && other_incremental_snapshot_archive.hash() == incremental_snapshot_archive.hash()
-        ));
-        info!("Checking if validator{i} has the same snapshots as validator3... DONE");
+        assert!(
+            other_incremental_snapshot_archives
+                .iter()
+                .any(
+                    |other_incremental_snapshot_archive| other_incremental_snapshot_archive
+                        .base_slot()
+                        == incremental_snapshot_archive.base_slot()
+                        && other_incremental_snapshot_archive.slot()
+                            == incremental_snapshot_archive.slot()
+                        && other_incremental_snapshot_archive.hash()
+                            == incremental_snapshot_archive.hash()
+                ),
+            "incremental snapshot archive does not match!\n  validator1: {:?}\n  validator{i}: {:?}",
+            (
+                BaseSlot(incremental_snapshot_archive.base_slot()),
+                SnapshotSlot(incremental_snapshot_archive.slot()),
+                incremental_snapshot_archive.hash(),
+            ),
+            other_incremental_snapshot_archives
+                .iter()
+                .sorted_unstable()
+                .rev()
+                .map(|snap| (
+                    BaseSlot(snap.base_slot()),
+                    SnapshotSlot(snap.slot()),
+                    snap.hash(),
+                ))
+                .collect::<Vec<_>>(),
+        );
+        info!("Checking if validator{i} has the same snapshots as validator1... DONE");
     }
 }
 
@@ -5673,20 +5752,19 @@ fn test_randomly_mixed_block_verification_methods_between_bootstrap_and_not() {
          info",
     );
 
-    let num_nodes = 2;
+    let num_nodes = BlockVerificationMethod::COUNT;
     let mut config = ClusterConfig::new_with_equal_stakes(
         num_nodes,
         DEFAULT_CLUSTER_LAMPORTS,
         DEFAULT_NODE_STAKE,
     );
 
-    // Randomly switch to use unified scheduler
-    config
-        .validator_configs
-        .iter_mut()
-        .choose(&mut rand::thread_rng())
-        .unwrap()
-        .block_verification_method = BlockVerificationMethod::UnifiedScheduler;
+    // Overwrite block_verification_method with shuffled variants
+    let mut methods = BlockVerificationMethod::iter().collect::<Vec<_>>();
+    methods.shuffle(&mut rand::thread_rng());
+    for (validator_config, method) in config.validator_configs.iter_mut().zip_eq(methods) {
+        validator_config.block_verification_method = method;
+    }
 
     let local = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
     cluster_tests::spend_and_verify_all_nodes(

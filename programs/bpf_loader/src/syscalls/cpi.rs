@@ -2,6 +2,7 @@ use {
     super::*,
     crate::serialization::account_data_region_memory_state,
     scopeguard::defer,
+    solana_feature_set::{self as feature_set, enable_bpf_loader_set_authority_checked_ix},
     solana_measure::measure::Measure,
     solana_program_runtime::invoke_context::SerializedAccountMetadata,
     solana_rbpf::{
@@ -9,7 +10,6 @@ use {
         memory_region::{MemoryRegion, MemoryState},
     },
     solana_sdk::{
-        feature_set::enable_bpf_loader_set_authority_checked_ix,
         saturating_add_assign,
         stable_layout::stable_instruction::StableInstruction,
         syscalls::{
@@ -137,6 +137,10 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
                 invoke_context.get_check_aligned(),
             )?;
             if direct_mapping {
+                if account_info.lamports.as_ptr() as u64 >= ebpf::MM_INPUT_START {
+                    return Err(SyscallError::InvalidPointer.into());
+                }
+
                 check_account_info_pointer(
                     invoke_context,
                     *ptr,
@@ -154,6 +158,10 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
         )?;
 
         let (serialized_data, vm_data_addr, ref_to_len_in_vm) = {
+            if direct_mapping && account_info.data.as_ptr() as u64 >= ebpf::MM_INPUT_START {
+                return Err(SyscallError::InvalidPointer.into());
+            }
+
             // Double translate data out of RefCell
             let data = *translate_type::<&[u8]>(
                 memory_mapping,
@@ -321,12 +329,6 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
             .saturating_sub(account_info as *const _ as *const u64 as u64);
 
         let ref_to_len_in_vm = if direct_mapping {
-            // In the same vein as the other check_account_info_pointer() checks, we don't lock this
-            // pointer to a specific address but we don't want it to be inside accounts, or callees
-            // might be able to write to the pointed memory.
-            if data_len_vm_addr >= ebpf::MM_INPUT_START {
-                return Err(SyscallError::InvalidPointer.into());
-            }
             VmValue::VmAddress {
                 vm_addr: data_len_vm_addr,
                 memory_mapping,
@@ -804,6 +806,21 @@ fn translate_account_infos<'a, T, F>(
 where
     F: Fn(&T) -> u64,
 {
+    let direct_mapping = invoke_context
+        .get_feature_set()
+        .is_active(&feature_set::bpf_account_data_direct_mapping::id());
+
+    // In the same vein as the other check_account_info_pointer() checks, we don't lock
+    // this pointer to a specific address but we don't want it to be inside accounts, or
+    // callees might be able to write to the pointed memory.
+    if direct_mapping
+        && account_infos_addr
+            .saturating_add(account_infos_len.saturating_mul(std::mem::size_of::<T>() as u64))
+            >= ebpf::MM_INPUT_START
+    {
+        return Err(SyscallError::InvalidPointer.into());
+    }
+
     let account_infos = translate_slice::<T>(
         memory_mapping,
         account_infos_addr,
@@ -1593,6 +1610,7 @@ mod tests {
         super::*,
         crate::mock_create_vm,
         assert_matches::assert_matches,
+        solana_feature_set::bpf_account_data_direct_mapping,
         solana_program_runtime::{
             invoke_context::SerializedAccountMetadata, with_mock_invoke_context,
         },
@@ -1602,7 +1620,6 @@ mod tests {
         solana_sdk::{
             account::{Account, AccountSharedData, ReadableAccount},
             clock::Epoch,
-            feature_set::bpf_account_data_direct_mapping,
             instruction::Instruction,
             system_program,
             transaction_context::TransactionAccount,

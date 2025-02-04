@@ -16,6 +16,8 @@ codecov = { repository = "solana-labs/solana", branch = "master", service = "git
 [dependencies]
 ahash = { workspace = true }
 anchor-lang = { workspace = true }
+anyhow = { workspace = true }
+arrayvec = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
 bs58 = { workspace = true }
@@ -25,6 +27,7 @@ chrono = { workspace = true, features = ["default", "serde"] }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
 etcd-client = { workspace = true, features = ["tls"] }
+funnel.workspace = true
 futures = { workspace = true }
 hashbrown.workspace = true
 histogram = { workspace = true }
@@ -54,14 +57,21 @@ serde_bytes = { workspace = true }
 serde_derive = { workspace = true }
 solana-accounts-db = { workspace = true }
 solana-bloom = { workspace = true }
+solana-builtins-default-costs = { workspace = true }
 solana-bundle = { workspace = true }
 solana-client = { workspace = true }
 solana-compute-budget = { workspace = true }
 solana-connection-cache = { workspace = true }
 solana-cost-model = { workspace = true }
 solana-entry = { workspace = true }
-solana-frozen-abi = { workspace = true, optional = true }
-solana-frozen-abi-macro = { workspace = true, optional = true }
+solana-feature-set = { workspace = true }
+solana-fee = { workspace = true }
+solana-frozen-abi = { workspace = true, optional = true, features = [
+    "frozen-abi",
+] }
+solana-frozen-abi-macro = { workspace = true, optional = true, features = [
+    "frozen-abi",
+] }
 solana-geyser-plugin-manager = { workspace = true }
 solana-gossip = { workspace = true }
 solana-ledger = { workspace = true }
@@ -70,17 +80,21 @@ solana-metrics = { workspace = true }
 solana-net-utils = { workspace = true }
 solana-perf = { workspace = true }
 solana-poh = { workspace = true }
-solana-program-runtime = { workspace = true }
 solana-quic-client = { workspace = true }
 solana-rayon-threadlimit = { workspace = true }
 solana-rpc = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-runtime = { workspace = true }
 solana-runtime-plugin = { workspace = true }
+solana-runtime-transaction = { workspace = true }
+solana-sanitize = { workspace = true }
 solana-sdk = { workspace = true }
 solana-send-transaction-service = { workspace = true }
+solana-short-vec = { workspace = true }
 solana-streamer = { workspace = true }
 solana-svm = { workspace = true }
+solana-svm-transaction = { workspace = true }
+solana-timings = { workspace = true }
 solana-tpu-client = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-turbine = { workspace = true }
@@ -109,6 +123,7 @@ solana-accounts-db = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
 solana-bundle = { workspace = true }
 solana-core = { path = ".", features = ["dev-context-only-utils"] }
+solana-cost-model = { workspace = true, features = ["dev-context-only-utils"] }
 solana-ledger = { workspace = true, features = ["dev-context-only-utils"] }
 solana-logger = { workspace = true }
 solana-poh = { workspace = true, features = ["dev-context-only-utils"] }
@@ -120,6 +135,7 @@ solana-stake-program = { workspace = true }
 solana-unified-scheduler-pool = { workspace = true, features = [
     "dev-context-only-utils",
 ] }
+solana-vote = { workspace = true, features = ["dev-context-only-utils"] }
 static_assertions = { workspace = true }
 systemstat = { workspace = true }
 test-case = { workspace = true }
@@ -128,11 +144,10 @@ test-case = { workspace = true }
 sysctl = { workspace = true }
 
 [build-dependencies]
-rustc_version = { workspace = true }
 tonic-build = { workspace = true }
 
 [features]
-dev-context-only-utils = []
+dev-context-only-utils = ["solana-runtime/dev-context-only-utils"]
 frozen-abi = [
     "dep:solana-frozen-abi",
     "dep:solana-frozen-abi-macro",
@@ -146,6 +161,7 @@ frozen-abi = [
     "solana-program-runtime/frozen-abi",
     "solana-runtime/frozen-abi",
     "solana-sdk/frozen-abi",
+    "solana-short-vec/frozen-abi",
     "solana-svm/frozen-abi",
     "solana-vote/frozen-abi",
     "solana-vote-program/frozen-abi",
@@ -162,3 +178,6 @@ name = "sigverify_stage"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+
+[lints]
+workspace = true

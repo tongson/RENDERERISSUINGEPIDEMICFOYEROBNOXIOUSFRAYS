@@ -8,7 +8,7 @@ use {
     itertools::izip,
     log::*,
     solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
-    solana_client::{connection_cache::ConnectionCache, rpc_client::RpcClient},
+    solana_client::connection_cache::ConnectionCache,
     solana_core::{
         consensus::tower_storage::FileTowerStorage,
         validator::{Validator, ValidatorConfig, ValidatorStartProgress},
@@ -18,7 +18,8 @@ use {
         contact_info::{ContactInfo, Protocol},
         gossip_service::discover_cluster,
     },
-    solana_ledger::{create_new_tmp_ledger, shred::Shred},
+    solana_ledger::{create_new_tmp_ledger_with_size, shred::Shred},
+    solana_rpc_client::rpc_client::RpcClient,
     solana_runtime::{
         genesis_utils::{
             create_genesis_config_with_vote_accounts_and_cluster_type, GenesisConfigInfo,
@@ -31,7 +32,6 @@ use {
         clock::{Slot, DEFAULT_DEV_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE},
         commitment_config::CommitmentConfig,
         epoch_schedule::EpochSchedule,
-        feature_set,
         genesis_config::{ClusterType, GenesisConfig},
         message::Message,
         poh_config::PohConfig,
@@ -311,9 +311,13 @@ impl LocalCluster {
             .native_instruction_processors
             .extend_from_slice(&config.native_instruction_processors);
 
-        let (leader_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let leader_contact_info = leader_node.info.clone();
         let mut leader_config = safe_clone_config(&config.validator_configs[0]);
+        let (leader_ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
+            &genesis_config,
+            leader_config.max_genesis_archive_unpacked_size,
+        );
+
+        let leader_contact_info = leader_node.info.clone();
         leader_config.rpc_addrs = Some((
             leader_node.info.rpc().unwrap(),
             leader_node.info.rpc_pubsub().unwrap(),
@@ -336,7 +340,9 @@ impl LocalCluster {
             socket_addr_space,
             DEFAULT_TPU_USE_QUIC,
             DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            DEFAULT_TPU_ENABLE_UDP,
+            // We are turning tpu_enable_udp to true in order to prevent concurrent local cluster tests
+            // to use the same QUIC ports due to SO_REUSEPORT.
+            true,
             32, // max connections per IpAddr per minute
             Arc::new(RwLock::new(None)),
             None,
@@ -492,7 +498,10 @@ impl LocalCluster {
         let validator_pubkey = validator_keypair.pubkey();
         let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
         let contact_info = validator_node.info.clone();
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&self.genesis_config);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
+            &self.genesis_config,
+            validator_config.max_genesis_archive_unpacked_size,
+        );
 
         // Give the validator some lamports to setup vote accounts
         if is_listener {
@@ -770,18 +779,6 @@ impl LocalCluster {
             == 0
         {
             // 1) Create vote account
-            // Unlike the bootstrap validator we have to check if the new vote state is being used
-            // as the cluster is already running, and using the wrong account size will cause the
-            // InitializeAccount tx to fail
-            let use_current_vote_state = client
-                .rpc_client()
-                .poll_get_balance_with_commitment(
-                    &feature_set::vote_state_add_vote_latency::id(),
-                    CommitmentConfig::processed(),
-                )
-                .unwrap_or(0)
-                > 0;
-
             let instructions = vote_instruction::create_account_with_config(
                 &from_account.pubkey(),
                 &vote_account_pubkey,
@@ -793,8 +790,7 @@ impl LocalCluster {
                 },
                 amount,
                 vote_instruction::CreateVoteAccountConfig {
-                    space: vote_state::VoteStateVersions::vote_state_size_of(use_current_vote_state)
-                        as u64,
+                    space: vote_state::VoteStateVersions::vote_state_size_of(true) as u64,
                     ..vote_instruction::CreateVoteAccountConfig::default()
                 },
             );

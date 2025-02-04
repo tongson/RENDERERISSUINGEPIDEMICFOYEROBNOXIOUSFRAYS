@@ -462,6 +462,7 @@ impl SendTransactionService {
                     stats
                         .sent_transactions
                         .fetch_add(transactions.len() as u64, Ordering::Relaxed);
+                    // TODO (LB): don't unwrap
                     let tpu_address = cluster_info
                         .my_contact_info()
                         .tpu(connection_cache.protocol())
@@ -544,6 +545,8 @@ impl SendTransactionService {
                         let bank_forks = bank_forks.read().unwrap();
                         (bank_forks.root_bank(), bank_forks.working_bank())
                     };
+
+                    // TODO (LB): don't unwrap
                     let tpu_address = cluster_info
                         .my_contact_info()
                         .tpu(connection_cache.protocol())
@@ -832,7 +835,7 @@ mod test {
         super::*,
         crate::tpu_info::NullTpuInfo,
         crossbeam_channel::{bounded, unbounded},
-        solana_gossip::contact_info::ContactInfo,
+        solana_gossip::cluster_info::{ClusterInfo, Node},
         solana_sdk::{
             account::AccountSharedData,
             genesis_config::create_genesis_config,
@@ -840,30 +843,26 @@ mod test {
             pubkey::Pubkey,
             signature::{Keypair, Signer},
             system_program, system_transaction,
-            timing::timestamp,
         },
         solana_streamer::socket::SocketAddrSpace,
         std::ops::Sub,
     };
-
-    fn new_test_cluster_info() -> Arc<ClusterInfo> {
-        let keypair = Arc::new(Keypair::new());
-        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
-        Arc::new(ClusterInfo::new(
-            contact_info,
-            keypair,
-            SocketAddrSpace::Unspecified,
-        ))
-    }
 
     #[test]
     fn service_exit() {
         let bank = Bank::default_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
         let (sender, receiver) = unbounded();
-
+        let cluster_info = {
+            let keypair = Arc::new(Keypair::new());
+            let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
+            Arc::new(ClusterInfo::new(
+                node.info,
+                keypair,
+                SocketAddrSpace::Unspecified,
+            ))
+        };
         let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
-        let cluster_info = new_test_cluster_info();
         let send_transaction_service = SendTransactionService::new::<NullTpuInfo>(
             cluster_info,
             &bank_forks,
@@ -881,7 +880,6 @@ mod test {
 
     #[test]
     fn validator_exit() {
-        let cluster_info = new_test_cluster_info();
         let bank = Bank::default_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
         let (sender, receiver) = bounded(0);
@@ -898,6 +896,15 @@ mod test {
 
         let exit = Arc::new(AtomicBool::new(false));
         let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
+        let cluster_info = {
+            let keypair = Arc::new(Keypair::new());
+            let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
+            Arc::new(ClusterInfo::new(
+                node.info.clone(),
+                keypair,
+                SocketAddrSpace::Unspecified,
+            ))
+        };
         let _send_transaction_service = SendTransactionService::new::<NullTpuInfo>(
             cluster_info,
             &bank_forks,

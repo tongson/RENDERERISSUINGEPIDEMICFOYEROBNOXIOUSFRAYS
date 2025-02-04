@@ -1,0 +1,18 @@
+[package]
+name = "funnel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license.workspace = true
+
+[features]
+bpf-entrypoint = []
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+borsh = "1.5.1"
+bytemuck = { workspace = true, features = ["derive"] }
+sha2-const-stable = "0.1.0"
+solana-program = { workspace = true }

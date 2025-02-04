@@ -14,6 +14,7 @@ bincode = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
+solana-log-collector = { workspace = true }
 solana-program-runtime = { workspace = true }
 solana-sdk = { workspace = true }
 solana-type-overrides = { workspace = true }
@@ -21,6 +22,7 @@ solana-type-overrides = { workspace = true }
 [dev-dependencies]
 assert_matches = { workspace = true }
 solana-compute-budget = { workspace = true }
+solana-feature-set = { workspace = true }
 solana-logger = { workspace = true }
 
 [lib]

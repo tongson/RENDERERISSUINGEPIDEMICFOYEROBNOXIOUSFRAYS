@@ -8,17 +8,17 @@ use {
     rand::Rng,
     rayon::iter::{IntoParallelRefIterator, ParallelIterator},
     solana_accounts_db::{
+        account_info::{AccountInfo, StorageLocation},
         accounts::{AccountAddressFilter, Accounts},
         accounts_db::{
-            test_utils::create_test_accounts, AccountShrinkThreshold, AccountsDb,
+            test_utils::create_test_accounts, AccountFromStorage, AccountsDb,
             VerifyAccountsHashAndLamportsConfig, ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS,
         },
-        accounts_index::{AccountSecondaryIndexes, ScanConfig},
+        accounts_index::ScanConfig,
         ancestors::Ancestors,
     },
     solana_sdk::{
         account::{Account, AccountSharedData, ReadableAccount},
-        genesis_config::ClusterType,
         hash::Hash,
         pubkey::Pubkey,
         rent_collector::RentCollector,
@@ -36,9 +36,6 @@ use {
 fn new_accounts_db(account_paths: Vec<PathBuf>) -> AccountsDb {
     AccountsDb::new_with_config(
         account_paths,
-        &ClusterType::Development,
-        AccountSecondaryIndexes::default(),
-        AccountShrinkThreshold::default(),
         Some(ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS),
         None,
         Arc::default(),
@@ -343,4 +340,50 @@ fn bench_load_largest_accounts(b: &mut Bencher) {
             false,
         )
     });
+}
+
+#[bench]
+fn bench_sort_and_remove_dups(b: &mut Bencher) {
+    fn generate_sample_account_from_storage(i: u8) -> AccountFromStorage {
+        // offset has to be 8 byte aligned
+        let offset = (i as usize) * std::mem::size_of::<u64>();
+        AccountFromStorage {
+            index_info: AccountInfo::new(StorageLocation::AppendVec(i as u32, offset), i as u64),
+            data_len: i as u64,
+            pubkey: Pubkey::new_from_array([i; 32]),
+        }
+    }
+
+    use rand::prelude::*;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
+    let accounts: Vec<_> =
+        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.gen::<u8>()))
+            .take(1000)
+            .collect();
+
+    b.iter(|| AccountsDb::sort_and_remove_dups(&mut accounts.clone()));
+}
+
+#[bench]
+fn bench_sort_and_remove_dups_no_dups(b: &mut Bencher) {
+    fn generate_sample_account_from_storage(i: u8) -> AccountFromStorage {
+        // offset has to be 8 byte aligned
+        let offset = (i as usize) * std::mem::size_of::<u64>();
+        AccountFromStorage {
+            index_info: AccountInfo::new(StorageLocation::AppendVec(i as u32, offset), i as u64),
+            data_len: i as u64,
+            pubkey: Pubkey::new_unique(),
+        }
+    }
+
+    use rand::prelude::*;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
+    let mut accounts: Vec<_> =
+        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.gen::<u8>()))
+            .take(1000)
+            .collect();
+
+    accounts.shuffle(&mut rng);
+
+    b.iter(|| AccountsDb::sort_and_remove_dups(&mut accounts.clone()));
 }

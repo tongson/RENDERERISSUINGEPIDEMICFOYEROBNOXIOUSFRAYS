@@ -201,7 +201,7 @@ mod tests {
         bank.freeze();
         assert_eq!(
             bank.read_cost_tracker().unwrap().block_cost_limit(),
-            solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
+            solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS_SIMD_0207,
         );
 
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &Pubkey::default(), 1));
@@ -231,7 +231,7 @@ mod tests {
         // after reservation, revert back to normal limit
         assert_eq!(
             bank1.read_cost_tracker().unwrap().block_cost_limit(),
-            solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
+            solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS_SIMD_0207,
         );
     }
 }

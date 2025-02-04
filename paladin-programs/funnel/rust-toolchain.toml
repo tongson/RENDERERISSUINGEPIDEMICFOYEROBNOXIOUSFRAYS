@@ -1,0 +1,7 @@
+# We must align our rust version with the validator we intend to support, in
+# this case v2.0.X.
+#
+# https://github.com/anza-xyz/agave/blob/v2.0/rust-toolchain.toml
+[toolchain]
+# TODO: This is actually 1 minor above 2.0 and 2 below 2.1...
+channel = "1.79.0"

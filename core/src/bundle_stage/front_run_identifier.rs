@@ -1,5 +1,4 @@
 use {
-    super::MAX_PACKETS_PER_BUNDLE,
     hashbrown::HashMap,
     itertools::izip,
     solana_bundle::bundle_execution::LoadAndExecuteBundleOutput,
@@ -12,7 +11,9 @@ use {
     std::cell::RefCell,
 };
 
-const AMM_PROGRAMS: &[Pubkey] = &[
+const MAX_PACKETS_PER_BUNDLE: usize = 5;
+
+pub(crate) const AMM_PROGRAMS: &[Pubkey] = &[
     solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"), // RaydiumV4
     solana_sdk::pubkey!("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"), // Serum DEX V3
     solana_sdk::pubkey!("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB"), // Meteora CPMM
@@ -146,27 +147,18 @@ impl<'a> BundleResult<'a> for LoadAndExecuteBundleOutput<'a> {
     fn transactions(&'a self) -> impl Iterator<Item = Self::Transaction> {
         self.bundle_transaction_results().iter().flat_map(|batch| {
             let output = batch.load_and_execute_transactions_output();
-            if batch.transactions().len() != output.loaded_transactions.len()
-                || batch.transactions().len() != output.execution_results.len()
+            if batch.transactions().len() != output.processing_results.len()
+                || batch.transactions().len() != output.processing_results.len()
             {
                 eprintln!("BUG: Invalid assumption about batch layout");
             }
 
-            izip!(
-                batch.transactions(),
-                &output.loaded_transactions,
-                &output.execution_results,
+            izip!(batch.transactions(), &output.processing_results,).filter_map(
+                |(sanitized, exec)| match exec {
+                    Ok(exec) => Some((sanitized, &exec.executed_transaction()?.loaded_transaction)),
+                    Err(_) => None,
+                },
             )
-            .filter_map(|(sanitized, loaded, exec)| {
-                match (loaded, exec.was_executed_successfully()) {
-                    (Ok(loaded), true) => Some((sanitized, loaded)),
-                    (Err(_), _) => {
-                        eprintln!("BUG: Unexpected load error");
-                        None
-                    }
-                    (Ok(_), false) => None,
-                }
-            })
         })
     }
 }
@@ -177,7 +169,8 @@ impl<'a> BundleTransaction for (&'a SanitizedTransaction, &'a LoadedTransaction)
             .message()
             .account_keys()
             .iter()
-            .take(self.0.message().num_signatures() as usize)
+            // TODO: Check what happens if a precompile is used.
+            .take(self.0.message().num_total_signatures() as usize)
     }
 
     fn writable_accounts_owners(&self) -> impl Iterator<Item = AccountRef> {

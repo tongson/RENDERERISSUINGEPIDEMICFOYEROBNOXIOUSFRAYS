@@ -127,7 +127,7 @@ impl AbiDigester {
             value.serialize(self.create_new())
         } else {
             // Don't call value.visit_for_abi(...) to prefer autoref specialization
-            // resolution for IgnoreAsHelper
+            // resolution for TransparentAsHelper
             <&T>::visit_for_abi(&value, &mut self.create_new())
         }
     }
@@ -657,7 +657,7 @@ mod tests {
     type TestBitVec = bv::BitVec<u64>;
 
     mod bitflags_abi {
-        use crate::abi_example::{AbiExample, EvenAsOpaque, IgnoreAsHelper};
+        use crate::abi_example::{AbiExample, EvenAsOpaque, TransparentAsHelper};
 
         bitflags::bitflags! {
             #[frozen_abi(digest = "HhKNkaeAd7AohTb8S8sPKjAWwzxWY2DPz5FvkWmx5bSH")]
@@ -673,7 +673,7 @@ mod tests {
             }
         }
 
-        impl IgnoreAsHelper for TestFlags {}
+        impl TransparentAsHelper for TestFlags {}
         // This (EvenAsOpaque) marker trait is needed for bitflags-generated types because we can't
         // impl AbiExample for its private type:
         // thread '...TestFlags_frozen_abi...' panicked at ...:
@@ -681,6 +681,36 @@ mod tests {
         //   solana_frozen_abi::abi_digester::tests::_::InternalBitFlags
         impl EvenAsOpaque for TestFlags {
             const TYPE_NAME_MATCHER: &'static str = "::_::InternalBitFlags";
+        }
+    }
+
+    mod serde_with_abi {
+        use serde_with::{serde_as, Bytes};
+
+        // This is a minimized testcase based on solana_sdk::packet::Packet
+        #[serde_as]
+        #[derive(serde_derive::Serialize, AbiExample)]
+        #[frozen_abi(digest = "DcR9EB87D4uQBjUrsendvcFgS5KSF7okjnxGx8ZaDE8Z")]
+        struct U8ArrayWithBytes {
+            #[serde_as(as = "Bytes")]
+            foo: [u8; 42],
+        }
+
+        #[serde_as]
+        #[derive(serde_derive::Serialize, AbiExample)]
+        #[frozen_abi(digest = "CVqaXh4pWCiUyAuZ6dZPCmbCEtJyNH3e6uwUpJzymT6b")]
+        struct U8ArrayWithGenericAs {
+            #[serde_as(as = "[_; 42]")]
+            foo: [u8; 42],
+        }
+
+        // This is a minimized testcase based on solana_lattice_hash::lt_hash::LtHash
+        #[serde_as]
+        #[derive(serde_derive::Serialize, AbiExample)]
+        #[frozen_abi(digest = "A1J57qgtrhpqk6vD4tjV1CHLPagacBKsXJBBUB5mdp5W")]
+        struct NotU8ArrayWithGenericAs {
+            #[serde_as(as = "[_; 42]")]
+            bar: [u16; 42],
         }
     }
 

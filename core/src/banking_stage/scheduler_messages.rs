@@ -1,10 +1,9 @@
 use {
-    super::immutable_deserialized_packet::ImmutableDeserializedPacket,
     solana_sdk::{
         clock::{Epoch, Slot},
         transaction::SanitizedTransaction,
     },
-    std::{fmt::Display, sync::Arc},
+    std::fmt::Display,
 };
 
 /// A unique identifier for a transaction batch.
@@ -24,7 +23,7 @@ impl Display for TransactionBatchId {
 }
 
 /// A unique identifier for a transaction.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TransactionId(u64);
 
 impl TransactionId {
@@ -61,22 +60,9 @@ pub struct ConsumeWork {
     pub max_ages: Vec<MaxAge>,
 }
 
-/// Message: [Scheduler -> Worker]
-/// Transactions to be forwarded to the next leader(s)
-pub struct ForwardWork {
-    pub packets: Vec<Arc<ImmutableDeserializedPacket>>,
-}
-
 /// Message: [Worker -> Scheduler]
 /// Processed transactions.
 pub struct FinishedConsumeWork {
     pub work: ConsumeWork,
     pub retryable_indexes: Vec<usize>,
-}
-
-/// Message: [Worker -> Scheduler]
-/// Forwarded transactions.
-pub struct FinishedForwardWork {
-    pub work: ForwardWork,
-    pub successful: bool,
 }

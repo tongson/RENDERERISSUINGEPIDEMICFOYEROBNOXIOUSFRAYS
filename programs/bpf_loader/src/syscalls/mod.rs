@@ -12,11 +12,26 @@ pub use self::{
 };
 #[allow(deprecated)]
 use {
-    solana_compute_budget::compute_budget::ComputeBudget,
-    solana_poseidon as poseidon,
-    solana_program_runtime::{
-        ic_logger_msg, ic_msg, invoke_context::InvokeContext, stable_log, timings::ExecuteTimings,
+    solana_bn254::prelude::{
+        alt_bn128_addition, alt_bn128_multiplication, alt_bn128_pairing, AltBn128Error,
+        ALT_BN128_ADDITION_OUTPUT_LEN, ALT_BN128_MULTIPLICATION_OUTPUT_LEN,
+        ALT_BN128_PAIRING_ELEMENT_LEN, ALT_BN128_PAIRING_OUTPUT_LEN,
     },
+    solana_compute_budget::compute_budget::ComputeBudget,
+    solana_feature_set::{
+        self as feature_set, abort_on_invalid_curve, blake3_syscall_enabled,
+        bpf_account_data_direct_mapping, curve25519_syscall_enabled,
+        disable_deploy_of_alloc_free_syscall, disable_fees_sysvar, disable_sbpf_v1_execution,
+        enable_alt_bn128_compression_syscall, enable_alt_bn128_syscall, enable_big_mod_exp_syscall,
+        enable_get_epoch_stake_syscall, enable_partitioned_epoch_reward, enable_poseidon_syscall,
+        get_sysvar_syscall_enabled, last_restart_slot_sysvar,
+        partitioned_epoch_rewards_superfeature, reenable_sbpf_v1_execution,
+        remaining_compute_units_syscall_enabled, FeatureSet,
+    },
+    solana_log_collector::{ic_logger_msg, ic_msg},
+    solana_poseidon as poseidon,
+    solana_program_memory::is_nonoverlapping,
+    solana_program_runtime::{invoke_context::InvokeContext, stable_log},
     solana_rbpf::{
         declare_builtin_function,
         memory_region::{AccessType, MemoryMapping},
@@ -25,32 +40,14 @@ use {
     },
     solana_sdk::{
         account_info::AccountInfo,
-        alt_bn128::prelude::{
-            alt_bn128_addition, alt_bn128_multiplication, alt_bn128_pairing, AltBn128Error,
-            ALT_BN128_ADDITION_OUTPUT_LEN, ALT_BN128_MULTIPLICATION_OUTPUT_LEN,
-            ALT_BN128_PAIRING_ELEMENT_LEN, ALT_BN128_PAIRING_OUTPUT_LEN,
-        },
         big_mod_exp::{big_mod_exp, BigModExpParams},
         blake3, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
         entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
-        feature_set::bpf_account_data_direct_mapping,
-        feature_set::FeatureSet,
-        feature_set::{
-            self, abort_on_invalid_curve, blake3_syscall_enabled, curve25519_syscall_enabled,
-            disable_deploy_of_alloc_free_syscall, disable_fees_sysvar,
-            enable_alt_bn128_compression_syscall, enable_alt_bn128_syscall,
-            enable_big_mod_exp_syscall, enable_get_epoch_stake_syscall,
-            enable_partitioned_epoch_reward, enable_poseidon_syscall,
-            error_on_syscall_bpf_function_hash_collisions, get_sysvar_syscall_enabled,
-            last_restart_slot_sysvar, partitioned_epoch_rewards_superfeature, reject_callx_r10,
-            remaining_compute_units_syscall_enabled, switch_to_new_elf_parser,
-        },
         hash::{Hash, Hasher},
         instruction::{AccountMeta, InstructionError, ProcessedSiblingInstruction},
         keccak, native_loader,
         precompiles::is_precompile,
         program::MAX_RETURN_DATA,
-        program_stubs::is_nonoverlapping,
         pubkey::{Pubkey, PubkeyError, MAX_SEEDS, MAX_SEED_LEN, PUBKEY_BYTES},
         secp256k1_recover::{
             Secp256k1RecoverError, SECP256K1_PUBLIC_KEY_LENGTH, SECP256K1_SIGNATURE_LENGTH,
@@ -58,6 +55,7 @@ use {
         sysvar::{Sysvar, SysvarId},
         transaction_context::{IndexOfAccount, InstructionAccount},
     },
+    solana_timings::ExecuteTimings,
     solana_type_overrides::sync::Arc,
     std::{
         alloc::Layout,
@@ -286,9 +284,6 @@ pub fn create_program_runtime_environment_v1<'a>(
     let get_sysvar_syscall_enabled = feature_set.is_active(&get_sysvar_syscall_enabled::id());
     let enable_get_epoch_stake_syscall =
         feature_set.is_active(&enable_get_epoch_stake_syscall::id());
-    // !!! ATTENTION !!!
-    // When adding new features for RBPF here,
-    // also add them to `Bank::apply_builtin_program_feature_transitions()`.
 
     let config = Config {
         max_call_depth: compute_budget.max_call_depth,
@@ -302,13 +297,12 @@ pub fn create_program_runtime_environment_v1<'a>(
         reject_broken_elfs: reject_deployment_of_broken_elfs,
         noop_instruction_rate: 256,
         sanitize_user_provided_values: true,
-        external_internal_function_hash_collision: feature_set
-            .is_active(&error_on_syscall_bpf_function_hash_collisions::id()),
-        reject_callx_r10: feature_set.is_active(&reject_callx_r10::id()),
-        enable_sbpf_v1: true,
+        external_internal_function_hash_collision: true,
+        reject_callx_r10: true,
+        enable_sbpf_v1: !feature_set.is_active(&disable_sbpf_v1_execution::id())
+            || feature_set.is_active(&reenable_sbpf_v1_execution::id()),
         enable_sbpf_v2: false,
         optimize_rodata: false,
-        new_elf_parser: feature_set.is_active(&switch_to_new_elf_parser::id()),
         aligned_memory_mapping: !feature_set.is_active(&bpf_account_data_direct_mapping::id()),
         // Warning, do not use `Config::default()` so that configuration here is explicit.
     };
@@ -492,6 +486,33 @@ pub fn create_program_runtime_environment_v1<'a>(
     result.register_function_hashed(*b"sol_log_data", SyscallLogData::vm)?;
 
     Ok(BuiltinProgram::new_loader(config, result))
+}
+
+pub fn create_program_runtime_environment_v2<'a>(
+    compute_budget: &ComputeBudget,
+    debugging_features: bool,
+) -> BuiltinProgram<InvokeContext<'a>> {
+    let config = Config {
+        max_call_depth: compute_budget.max_call_depth,
+        stack_frame_size: compute_budget.stack_frame_size,
+        enable_address_translation: true, // To be deactivated once we have BTF inference and verification
+        enable_stack_frame_gaps: false,
+        instruction_meter_checkpoint_distance: 10000,
+        enable_instruction_meter: true,
+        enable_instruction_tracing: debugging_features,
+        enable_symbol_and_section_labels: debugging_features,
+        reject_broken_elfs: true,
+        noop_instruction_rate: 256,
+        sanitize_user_provided_values: true,
+        external_internal_function_hash_collision: true,
+        reject_callx_r10: true,
+        enable_sbpf_v1: false,
+        enable_sbpf_v2: true,
+        optimize_rodata: true,
+        aligned_memory_mapping: true,
+        // Warning, do not use `Config::default()` so that configuration here is explicit.
+    };
+    BuiltinProgram::new_loader(config, FunctionRegistry::default())
 }
 
 fn address_is_aligned<T>(address: u64) -> bool {
@@ -1575,7 +1596,7 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        use solana_sdk::alt_bn128::prelude::{ALT_BN128_ADD, ALT_BN128_MUL, ALT_BN128_PAIRING};
+        use solana_bn254::prelude::{ALT_BN128_ADD, ALT_BN128_MUL, ALT_BN128_PAIRING};
         let budget = invoke_context.get_compute_budget();
         let (cost, output): (u64, usize) = match group_op {
             ALT_BN128_ADD => (
@@ -1687,13 +1708,15 @@ declare_builtin_function!(
         let input_len: u64 = std::cmp::max(input_len, params.modulus_len);
 
         let budget = invoke_context.get_compute_budget();
+        // the compute units are calculated by the quadratic equation `0.5 input_len^2 + 190`
         consume_compute_meter(
             invoke_context,
             budget.syscall_base_cost.saturating_add(
                 input_len
                     .saturating_mul(input_len)
-                    .checked_div(budget.big_modular_exponentiation_cost)
-                    .unwrap_or(u64::MAX),
+                    .checked_div(budget.big_modular_exponentiation_cost_divisor)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(budget.big_modular_exponentiation_base_cost),
             ),
         )?;
 
@@ -1842,7 +1865,7 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        use solana_sdk::alt_bn128::compression::prelude::{
+        use solana_bn254::compression::prelude::{
             alt_bn128_g1_compress, alt_bn128_g1_decompress, alt_bn128_g2_compress,
             alt_bn128_g2_decompress, ALT_BN128_G1_COMPRESS, ALT_BN128_G1_DECOMPRESS,
             ALT_BN128_G2_COMPRESS, ALT_BN128_G2_DECOMPRESS, G1, G1_COMPRESSED, G2, G2_COMPRESSED,
@@ -4696,7 +4719,8 @@ mod tests {
             let budget = invoke_context.get_compute_budget();
             invoke_context.mock_set_remaining(
                 budget.syscall_base_cost
-                    + (MAX_LEN * MAX_LEN) / budget.big_modular_exponentiation_cost,
+                    + (MAX_LEN * MAX_LEN) / budget.big_modular_exponentiation_cost_divisor
+                    + budget.big_modular_exponentiation_base_cost,
             );
 
             let result = SyscallBigModExp::rust(
@@ -4737,7 +4761,8 @@ mod tests {
             let budget = invoke_context.get_compute_budget();
             invoke_context.mock_set_remaining(
                 budget.syscall_base_cost
-                    + (INV_LEN * INV_LEN) / budget.big_modular_exponentiation_cost,
+                    + (INV_LEN * INV_LEN) / budget.big_modular_exponentiation_cost_divisor
+                    + budget.big_modular_exponentiation_base_cost,
             );
 
             let result = SyscallBigModExp::rust(
@@ -4823,15 +4848,7 @@ mod tests {
         let mut vote_accounts_map = HashMap::new();
         vote_accounts_map.insert(
             vote_address,
-            (
-                expected_epoch_stake,
-                VoteAccount::try_from(AccountSharedData::new(
-                    0,
-                    0,
-                    &solana_sdk::vote::program::id(),
-                ))
-                .unwrap(),
-            ),
+            (expected_epoch_stake, VoteAccount::new_random()),
         );
 
         with_mock_invoke_context!(invoke_context, transaction_context, vec![]);

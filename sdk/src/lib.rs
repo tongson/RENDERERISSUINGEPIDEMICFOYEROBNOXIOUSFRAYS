@@ -30,7 +30,7 @@
 //! [`clap`]: https://docs.rs/clap
 
 #![allow(incomplete_features)]
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(specialization))]
+#![cfg_attr(feature = "frozen-abi", feature(specialization))]
 
 // Allows macro expansion of `use ::solana_sdk::*` to work within this crate
 extern crate self as solana_sdk;
@@ -46,27 +46,22 @@ pub use solana_program::sdk_ids;
 #[cfg(target_arch = "wasm32")]
 pub use solana_program::wasm_bindgen;
 pub use solana_program::{
-    account_info, address_lookup_table, alt_bn128, big_mod_exp, blake3, bpf_loader,
-    bpf_loader_deprecated, bpf_loader_upgradeable, clock, config, custom_heap_default,
-    custom_panic_default, debug_account_data, declare_deprecated_sysvar_id, declare_sysvar_id,
-    decode_error, ed25519_program, epoch_rewards, epoch_schedule, fee_calculator, impl_sysvar_get,
-    incinerator, instruction, keccak, lamports, loader_instruction, loader_upgradeable_instruction,
-    loader_v4, loader_v4_instruction, message, msg, native_token, nonce, program, program_error,
-    program_memory, program_option, program_pack, rent, sanitize, secp256k1_program,
-    secp256k1_recover, serde_varint, serialize_utils, short_vec, slot_hashes, slot_history,
-    stable_layout, stake, stake_history, syscalls, system_instruction, system_program, sysvar,
-    unchecked_div_by_const, vote,
+    account_info, address_lookup_table, big_mod_exp, blake3, bpf_loader, bpf_loader_deprecated,
+    bpf_loader_upgradeable, clock, config, custom_heap_default, custom_panic_default,
+    debug_account_data, declare_deprecated_sysvar_id, declare_sysvar_id, ed25519_program,
+    epoch_rewards, epoch_schedule, fee_calculator, impl_sysvar_get, incinerator, instruction,
+    keccak, lamports, loader_instruction, loader_upgradeable_instruction, loader_v4,
+    loader_v4_instruction, message, msg, native_token, nonce, program, program_error,
+    program_option, program_pack, rent, secp256k1_program, serialize_utils, slot_hashes,
+    slot_history, stable_layout, stake, stake_history, syscalls, system_instruction,
+    system_program, sysvar, unchecked_div_by_const, vote,
 };
 #[cfg(feature = "borsh")]
 pub use solana_program::{borsh, borsh0_10, borsh1};
-
-pub mod account;
-pub mod account_utils;
 pub mod bundle;
 pub mod client;
 pub mod commitment_config;
 pub mod compute_budget;
-pub mod derivation_path;
 pub mod deserialize_utils;
 pub mod ed25519_instruction;
 pub mod entrypoint;
@@ -76,19 +71,16 @@ pub mod epoch_rewards_hasher;
 pub mod example_mocks;
 pub mod exit;
 pub mod feature;
-pub mod feature_set;
 pub mod fee;
 pub mod genesis_config;
 pub mod hard_forks;
 pub mod hash;
-pub mod inflation;
 pub mod inner_instruction;
 pub mod log;
 pub mod native_loader;
 pub mod net;
 pub mod nonce_account;
 pub mod offchain_message;
-pub mod packet;
 pub mod poh_config;
 pub mod precompiles;
 pub mod program_utils;
@@ -112,6 +104,46 @@ pub mod transaction_context;
 pub mod transport;
 pub mod wasm;
 
+#[deprecated(since = "2.1.0", note = "Use `solana-account` crate instead")]
+pub use solana_account as account;
+#[deprecated(
+    since = "2.1.0",
+    note = "Use `solana_account::state_traits` crate instead"
+)]
+pub use solana_account::state_traits as account_utils;
+#[deprecated(since = "2.1.0", note = "Use `solana-bn254` crate instead")]
+pub use solana_bn254 as alt_bn128;
+#[deprecated(since = "2.1.0", note = "Use `solana-decode-error` crate instead")]
+pub use solana_decode_error as decode_error;
+#[deprecated(since = "2.1.0", note = "Use `solana-derivation-path` crate instead")]
+pub use solana_derivation_path as derivation_path;
+#[deprecated(since = "2.1.0", note = "Use `solana-feature-set` crate instead")]
+pub use solana_feature_set as feature_set;
+#[deprecated(since = "2.1.0", note = "Use `solana-inflation` crate instead")]
+pub use solana_inflation as inflation;
+#[deprecated(since = "2.1.0", note = "Use `solana-packet` crate instead")]
+pub use solana_packet as packet;
+#[deprecated(since = "2.1.0", note = "Use `solana-program-memory` crate instead")]
+pub use solana_program_memory as program_memory;
+#[deprecated(since = "2.1.0", note = "Use `solana_pubkey::pubkey` instead")]
+/// Convenience macro to define a static public key.
+///
+/// Input: a single literal base58 string representation of a Pubkey
+///
+/// # Example
+///
+/// ```
+/// use std::str::FromStr;
+/// use solana_program::{pubkey, pubkey::Pubkey};
+///
+/// static ID: Pubkey = pubkey!("My11111111111111111111111111111111111111111");
+///
+/// let my_id = Pubkey::from_str("My11111111111111111111111111111111111111111").unwrap();
+/// assert_eq!(ID, my_id);
+/// ```
+pub use solana_pubkey::pubkey;
+#[deprecated(since = "2.1.0", note = "Use `solana-sanitize` crate instead")]
+pub use solana_sanitize as sanitize;
 /// Same as `declare_id` except report that this id has been deprecated.
 pub use solana_sdk_macro::declare_deprecated_id;
 /// Convenience macro to declare a static public key and functions to interact with it.
@@ -136,26 +168,14 @@ pub use solana_sdk_macro::declare_deprecated_id;
 /// assert_eq!(id(), my_id);
 /// ```
 pub use solana_sdk_macro::declare_id;
-/// Convenience macro to define a static public key.
-///
-/// Input: a single literal base58 string representation of a Pubkey
-///
-/// # Example
-///
-/// ```
-/// use std::str::FromStr;
-/// use solana_program::{pubkey, pubkey::Pubkey};
-///
-/// static ID: Pubkey = pubkey!("My11111111111111111111111111111111111111111");
-///
-/// let my_id = Pubkey::from_str("My11111111111111111111111111111111111111111").unwrap();
-/// assert_eq!(ID, my_id);
-/// ```
-pub use solana_sdk_macro::pubkey;
 /// Convenience macro to define multiple static public keys.
 pub use solana_sdk_macro::pubkeys;
-#[rustversion::since(1.46.0)]
-pub use solana_sdk_macro::respan;
+#[deprecated(since = "2.1.0", note = "Use `solana-secp256k1-recover` crate instead")]
+pub use solana_secp256k1_recover as secp256k1_recover;
+#[deprecated(since = "2.1.0", note = "Use `solana-serde-varint` crate instead")]
+pub use solana_serde_varint as serde_varint;
+#[deprecated(since = "2.1.0", note = "Use `solana-short-vec` crate instead")]
+pub use solana_short_vec as short_vec;
 
 /// Convenience macro for `AddAssign` with saturating arithmetic.
 /// Replace by `std::num::Saturating` once stable

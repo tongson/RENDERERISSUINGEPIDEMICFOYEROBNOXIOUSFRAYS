@@ -1,12 +1,16 @@
 use {
     crate::{
-        banking_stage::immutable_deserialized_packet::ImmutableDeserializedPacket,
+        banking_stage::{
+            immutable_deserialized_packet::{DeserializedPacketError, ImmutableDeserializedPacket},
+            packet_filter::PacketFilterFailure,
+        },
         packet_bundle::PacketBundle,
     },
+    solana_bundle::SanitizedBundle,
     solana_perf::sigverify::verify_packet,
     solana_runtime::bank::Bank,
     solana_sdk::{
-        bundle::SanitizedBundle, clock::MAX_PROCESSING_AGE, pubkey::Pubkey, signature::Signature,
+        clock::MAX_PROCESSING_AGE, pubkey::Pubkey, signature::Signature,
         transaction::SanitizedTransaction,
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
@@ -17,10 +21,10 @@ use {
     thiserror::Error,
 };
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum DeserializedBundleError {
-    #[error("FailedToSerializePacket")]
-    FailedToSerializePacket,
+    #[error("FailedToSerializePacket: {0}")]
+    FailedToSerializePacket(#[from] DeserializedPacketError),
 
     #[error("EmptyBatch")]
     EmptyBatch,
@@ -48,6 +52,9 @@ pub enum DeserializedBundleError {
 
     #[error("Bundle failed check_transactions")]
     FailedCheckTransactions,
+
+    #[error("PacketFilterFailure: {0}")]
+    PacketFilterFailure(#[from] PacketFilterFailure),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,6 +67,9 @@ impl ImmutableDeserializedBundle {
     pub fn new(
         bundle: &mut PacketBundle,
         max_len: Option<usize>,
+        packet_filter: &impl Fn(
+            ImmutableDeserializedPacket,
+        ) -> Result<ImmutableDeserializedPacket, PacketFilterFailure>,
     ) -> Result<Self, DeserializedBundleError> {
         // Checks: non-zero, less than some length, marked for discard, signature verification failed, failed to sanitize to
         // ImmutableDeserializedPacket
@@ -79,14 +89,11 @@ impl ImmutableDeserializedBundle {
             return Err(DeserializedBundleError::SignatureVerificationFailure);
         }
 
-        let immutable_packets: Vec<_> = bundle
-            .batch
-            .iter()
-            .filter_map(|p| ImmutableDeserializedPacket::new(p.clone()).ok())
-            .collect();
-
-        if bundle.batch.len() != immutable_packets.len() {
-            return Err(DeserializedBundleError::FailedToSerializePacket);
+        let mut immutable_packets = Vec::with_capacity(bundle.batch.len());
+        for packet in bundle.batch.iter() {
+            let immutable_packet = ImmutableDeserializedPacket::new(packet.clone())?;
+            let immutable_packet = packet_filter(immutable_packet)?;
+            immutable_packets.push(immutable_packet);
         }
 
         Ok(Self {
@@ -128,8 +135,7 @@ impl ImmutableDeserializedBundle {
                     bank,
                     bank.get_reserved_account_keys(),
                 )
-                // if buffering bundles across slot boundaries, it's required to examine this slot
-                .map(|(tx, _slot)| tx)
+                .map(|(tx, _)| tx)
             })
             .collect();
 
@@ -223,6 +229,7 @@ mod tests {
                 bundle_id: String::default(),
             },
             None,
+            &Ok,
         )
         .unwrap();
 
@@ -243,13 +250,14 @@ mod tests {
 
     #[test]
     fn test_empty_batch_fails_to_init() {
-        assert_eq!(
+        assert_matches!(
             ImmutableDeserializedBundle::new(
                 &mut PacketBundle {
                     batch: PacketBatch::new(vec![]),
                     bundle_id: String::default(),
                 },
                 None,
+                &Ok
             ),
             Err(DeserializedBundleError::EmptyBatch)
         );
@@ -259,7 +267,7 @@ mod tests {
     fn test_too_many_packets_fails_to_init() {
         let kp = Keypair::new();
 
-        assert_eq!(
+        assert_matches!(
             ImmutableDeserializedBundle::new(
                 &mut PacketBundle {
                     batch: PacketBatch::new(
@@ -276,6 +284,7 @@ mod tests {
                     bundle_id: String::default(),
                 },
                 Some(5),
+                &Ok
             ),
             Err(DeserializedBundleError::TooManyPackets)
         );
@@ -289,13 +298,14 @@ mod tests {
             Packet::from_data(None, transfer(&kp, &kp.pubkey(), 100, Hash::default())).unwrap();
         packet.meta_mut().set_discard(true);
 
-        assert_eq!(
+        assert_matches!(
             ImmutableDeserializedBundle::new(
                 &mut PacketBundle {
                     batch: PacketBatch::new(vec![packet]),
                     bundle_id: String::default(),
                 },
                 Some(5),
+                &Ok
             ),
             Err(DeserializedBundleError::MarkedDiscard)
         );
@@ -310,13 +320,14 @@ mod tests {
         let tx1 = transfer(&kp1, &kp0.pubkey(), 100, Hash::default());
         tx0.signatures = tx1.signatures;
 
-        assert_eq!(
+        assert_matches!(
             ImmutableDeserializedBundle::new(
                 &mut PacketBundle {
                     batch: PacketBatch::new(vec![Packet::from_data(None, tx0).unwrap()]),
                     bundle_id: String::default(),
                 },
-                None
+                None,
+                &Ok
             ),
             Err(DeserializedBundleError::SignatureVerificationFailure)
         );
@@ -349,6 +360,7 @@ mod tests {
                 bundle_id: String::default(),
             },
             None,
+            &Ok,
         )
         .unwrap();
 
@@ -385,6 +397,7 @@ mod tests {
                 bundle_id: String::default(),
             },
             None,
+            &Ok,
         )
         .unwrap();
 
@@ -414,6 +427,7 @@ mod tests {
                 bundle_id: String::default(),
             },
             None,
+            &Ok,
         )
         .unwrap();
 
@@ -449,6 +463,7 @@ mod tests {
                 bundle_id: String::default(),
             },
             None,
+            &Ok,
         )
         .unwrap();
 
@@ -478,6 +493,7 @@ mod tests {
                 bundle_id: String::default(),
             },
             None,
+            &Ok,
         )
         .unwrap();
 

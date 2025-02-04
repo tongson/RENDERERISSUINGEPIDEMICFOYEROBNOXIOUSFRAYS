@@ -11,15 +11,14 @@ use {
         recycler::Recycler,
     },
     rayon::{prelude::*, ThreadPool},
-    solana_metrics::inc_new_counter_debug,
     solana_rayon_threadlimit::get_thread_count,
     solana_sdk::{
         hash::Hash,
         message::{MESSAGE_HEADER_LENGTH, MESSAGE_VERSION_PREFIX},
         pubkey::Pubkey,
-        short_vec::decode_shortu16_len,
         signature::Signature,
     },
+    solana_short_vec::decode_shortu16_len,
     std::{convert::TryFrom, mem::size_of},
 };
 
@@ -518,20 +517,12 @@ pub fn shrink_batches(batches: &mut Vec<PacketBatch>) {
 pub fn ed25519_verify_cpu(batches: &mut [PacketBatch], reject_non_vote: bool, packet_count: usize) {
     debug!("CPU ECDSA for {}", packet_count);
     PAR_THREAD_POOL.install(|| {
-        batches
-            .par_iter_mut()
-            .flatten()
-            .collect::<Vec<&mut Packet>>()
-            .par_chunks_mut(VERIFY_PACKET_CHUNK_SIZE)
-            .for_each(|packets| {
-                for packet in packets.iter_mut() {
-                    if !packet.meta().discard() && !verify_packet(packet, reject_non_vote) {
-                        packet.meta_mut().set_discard(true);
-                    }
-                }
-            });
+        batches.par_iter_mut().flatten().for_each(|packet| {
+            if !packet.meta().discard() && !verify_packet(packet, reject_non_vote) {
+                packet.meta_mut().set_discard(true);
+            }
+        });
     });
-    inc_new_counter_debug!("ed25519_verify_cpu", packet_count);
 }
 
 pub fn ed25519_verify_disabled(batches: &mut [PacketBatch]) {
@@ -542,7 +533,6 @@ pub fn ed25519_verify_disabled(batches: &mut [PacketBatch]) {
             .par_iter_mut()
             .for_each(|p| p.meta_mut().set_discard(false))
     });
-    inc_new_counter_debug!("ed25519_verify_disabled", packet_count);
 }
 
 pub fn copy_return_values<I, T>(sig_lens: I, out: &PinnedVec<u8>, rvs: &mut [Vec<u8>])
@@ -672,7 +662,6 @@ pub fn ed25519_verify(
     trace!("done verify");
     copy_return_values(sig_lens, &out, &mut rvs);
     mark_disabled(batches, &rvs);
-    inc_new_counter_debug!("ed25519_verify_gpu", valid_packet_count);
 }
 
 #[cfg(test)]
@@ -1280,7 +1269,7 @@ mod tests {
             for _ in 0..1_000_000 {
                 thread_rng().fill(&mut input);
                 let ans = get_checked_scalar(&input);
-                let ref_ans = Scalar::from_canonical_bytes(input);
+                let ref_ans = Scalar::from_canonical_bytes(input).into_option();
                 if let Some(ref_ans) = ref_ans {
                     passed += 1;
                     assert_eq!(ans.unwrap(), ref_ans.to_bytes());
@@ -1315,7 +1304,7 @@ mod tests {
             for _ in 0..1_000_000 {
                 thread_rng().fill(&mut input);
                 let ans = check_packed_ge_small_order(&input);
-                let ref_ge = CompressedEdwardsY::from_slice(&input);
+                let ref_ge = CompressedEdwardsY::from_slice(&input).unwrap();
                 if let Some(ref_element) = ref_ge.decompress() {
                     if ref_element.is_small_order() {
                         assert!(!ans);

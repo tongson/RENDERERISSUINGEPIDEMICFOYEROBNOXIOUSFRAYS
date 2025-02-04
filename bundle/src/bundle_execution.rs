@@ -1,35 +1,33 @@
 use {
-    crate::bundle_account_locker::{ExclusivityError, LockedBundle},
+    crate::SanitizedBundle,
     itertools::izip,
     log::*,
-    solana_accounts_db::accounts::Accounts,
     solana_ledger::token_balances::collect_token_balances,
     solana_measure::{measure::Measure, measure_us},
-    solana_program_runtime::timings::ExecuteTimings,
     solana_runtime::{
+        account_saver::collect_accounts_to_store,
         bank::{Bank, LoadAndExecuteTransactionsOutput, TransactionBalances},
         transaction_batch::TransactionBatch,
     },
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
-        bundle::SanitizedBundle,
-        nonce::state::DurableNonce,
         pubkey::Pubkey,
         saturating_add_assign,
         signature::Signature,
         transaction::{SanitizedTransaction, TransactionError, VersionedTransaction},
     },
     solana_svm::{
-        account_loader::TransactionLoadResult,
         account_overrides::AccountOverrides,
+        transaction_error_metrics::TransactionErrorMetrics,
         transaction_processing_callback::TransactionProcessingCallback,
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
-        transaction_results::TransactionExecutionResult,
     },
+    solana_timings::ExecuteTimings,
     solana_transaction_status::{token_balances::TransactionTokenBalances, PreBalanceInfo},
     std::{
         cmp::{max, min},
-        sync::Arc,
+        result,
         time::{Duration, Instant},
     },
     thiserror::Error,
@@ -43,6 +41,7 @@ pub struct BundleExecutionMetrics {
     pub collect_pre_post_accounts_us: u64,
     pub cache_accounts_us: u64,
     pub execute_timings: ExecuteTimings,
+    pub errors: TransactionErrorMetrics,
 }
 
 /// Contains the results from executing each TransactionBatch with a final result associated with it
@@ -105,14 +104,11 @@ pub enum LoadAndExecuteBundleError {
     TransactionError {
         signature: Signature,
         // Box reduces the size between variants in the Error
-        execution_result: Box<TransactionExecutionResult>,
+        execution_result: Box<TransactionProcessingResult>,
     },
 
     #[error("Invalid pre or post accounts")]
     InvalidPreOrPostAccounts,
-
-    #[error("Account was in use and transaction was not FIFO")]
-    AccountInUse,
 }
 
 pub struct BundleTransactionsOutput<'a> {
@@ -132,13 +128,12 @@ impl<'a> BundleTransactionsOutput<'a> {
             .iter()
             .zip(
                 self.load_and_execute_transactions_output
-                    .execution_results
+                    .processing_results
                     .iter(),
             )
             .filter_map(|(tx, exec_result)| {
-                exec_result
-                    .was_executed()
-                    .then_some(tx.to_versioned_transaction())
+                matches!(exec_result, Ok(ProcessedTransaction::Executed(_)))
+                    .then(|| tx.to_versioned_transaction())
             })
             .collect()
     }
@@ -148,10 +143,10 @@ impl<'a> BundleTransactionsOutput<'a> {
             .iter()
             .zip(
                 self.load_and_execute_transactions_output
-                    .execution_results
+                    .processing_results
                     .iter(),
             )
-            .filter_map(|(tx, exec_result)| exec_result.was_executed().then_some(tx))
+            .filter_map(|(tx, exec_result)| exec_result.is_ok().then_some(tx))
             .collect()
     }
 
@@ -163,22 +158,12 @@ impl<'a> BundleTransactionsOutput<'a> {
         self.transactions
     }
 
-    pub fn loaded_transactions_mut(&mut self) -> &mut [TransactionLoadResult] {
-        &mut self
-            .load_and_execute_transactions_output
-            .loaded_transactions
-    }
-
-    pub fn execution_results(&self) -> &[TransactionExecutionResult] {
-        &self.load_and_execute_transactions_output.execution_results
+    pub fn execution_results(&self) -> &[TransactionProcessingResult] {
+        &self.load_and_execute_transactions_output.processing_results
     }
 
     pub fn pre_balance_info(&self) -> &PreBalanceInfo {
         &self.pre_balance_info
-    }
-
-    pub fn pre_balance_info_mut(&mut self) -> &mut PreBalanceInfo {
-        &mut self.pre_balance_info
     }
 
     pub fn post_balance_info(&self) -> &(TransactionBalances, TransactionTokenBalances) {
@@ -194,25 +179,30 @@ impl<'a> BundleTransactionsOutput<'a> {
     }
 }
 
-pub type LoadAndExecuteBundleResult<T> = Result<T, LoadAndExecuteBundleError>;
+pub type LoadAndExecuteBundleResult<T> = result::Result<T, LoadAndExecuteBundleError>;
 
 /// Return an Error if a transaction was executed and reverted
 /// NOTE: `execution_results` are zipped with `sanitized_txs` so it's expected a sanitized tx at
 /// position i has a corresponding execution result at position i within the `execution_results`
 /// slice
 pub fn check_bundle_execution_results<'a>(
-    execution_results: &'a [TransactionExecutionResult],
+    execution_results: &'a [TransactionProcessingResult],
     sanitized_txs: &'a [SanitizedTransaction],
-) -> Result<(), (&'a SanitizedTransaction, &'a TransactionExecutionResult)> {
+) -> result::Result<(), (&'a SanitizedTransaction, &'a TransactionProcessingResult)> {
     for (exec_results, sanitized_tx) in execution_results.iter().zip(sanitized_txs) {
         match exec_results {
-            TransactionExecutionResult::Executed { details, .. } => {
-                if details.status.is_err() {
-                    return Err((sanitized_tx, exec_results));
-                }
+            Err(TransactionError::AccountInUse) => {
+                // AccountInUse is expected and should be retried
+                continue;
             }
-            TransactionExecutionResult::NotExecuted(e) => {
-                if !matches!(e, TransactionError::AccountInUse) {
+            Err(_) => {
+                return Err((sanitized_tx, exec_results));
+            }
+            Ok(ProcessedTransaction::FeesOnly(_)) => {
+                return Err((sanitized_tx, exec_results));
+            }
+            Ok(ProcessedTransaction::Executed(executed_transaction)) => {
+                if !executed_transaction.execution_details.was_successful() {
                     return Err((sanitized_tx, exec_results));
                 }
             }
@@ -233,9 +223,8 @@ pub fn check_bundle_execution_results<'a>(
 ///   we should add in the BundleTransactionsOutput of A and C and return the error for B.
 #[allow(clippy::too_many_arguments)]
 pub fn load_and_execute_bundle<'a>(
-    bank: &Arc<Bank>,
-    locked_bundle: Option<&mut LockedBundle>,
-    sanitized_bundle: &'a SanitizedBundle,
+    bank: &Bank,
+    bundle: &'a SanitizedBundle,
     // Max blockhash age
     max_age: usize,
     // Upper bound on execution time for a bundle
@@ -252,10 +241,9 @@ pub fn load_and_execute_bundle<'a>(
     // will use AccountsOverride + Bank
     pre_execution_accounts: &[Option<Vec<Pubkey>>],
     post_execution_accounts: &[Option<Vec<Pubkey>>],
-    fifo: bool,
 ) -> LoadAndExecuteBundleOutput<'a> {
     if pre_execution_accounts.len() != post_execution_accounts.len()
-        || post_execution_accounts.len() != sanitized_bundle.transactions.len()
+        || post_execution_accounts.len() != bundle.transactions.len()
     {
         return LoadAndExecuteBundleOutput {
             bundle_transaction_results: vec![],
@@ -267,7 +255,7 @@ pub fn load_and_execute_bundle<'a>(
     let mut binding = AccountOverrides::default();
     let account_overrides = account_overrides.unwrap_or(&mut binding);
     if is_simulation {
-        sanitized_bundle
+        bundle
             .transactions
             .iter()
             .map(|tx| tx.message().account_keys())
@@ -296,29 +284,9 @@ pub fn load_and_execute_bundle<'a>(
     let mut bundle_transaction_results = vec![];
     let mut metrics = BundleExecutionMetrics::default();
 
-    // NB: We need to make the locks exclusive to avoid races between Paladin & Jito thread.
-    if let Some(locked_bundle) = locked_bundle {
-        loop {
-            match (fifo, locked_bundle.try_make_exclusive()) {
-                (_, Ok(_)) => break,
-                (true, Err(ExclusivityError)) => std::thread::sleep(Duration::from_millis(5)),
-                (false, Err(ExclusivityError)) => {
-                    return LoadAndExecuteBundleOutput {
-                        bundle_transaction_results,
-                        metrics,
-                        result: Err(LoadAndExecuteBundleError::AccountInUse),
-                    };
-                }
-            }
-        }
-    }
-
-    while chunk_start != sanitized_bundle.transactions.len() {
+    while chunk_start != bundle.transactions.len() {
         if start_time.elapsed() > *max_processing_time {
-            trace!(
-                "bundle: {} took too long to execute",
-                sanitized_bundle.bundle_id
-            );
+            trace!("bundle: {} took too long to execute", bundle.bundle_id);
             return LoadAndExecuteBundleOutput {
                 bundle_transaction_results,
                 metrics,
@@ -328,11 +296,8 @@ pub fn load_and_execute_bundle<'a>(
             };
         }
 
-        let chunk_end = min(
-            sanitized_bundle.transactions.len(),
-            chunk_start.saturating_add(128),
-        );
-        let chunk = &sanitized_bundle.transactions[chunk_start..chunk_end];
+        let chunk_end = min(bundle.transactions.len(), chunk_start.saturating_add(128));
+        let chunk = &bundle.transactions[chunk_start..chunk_end];
 
         // Note: these batches are dropped after execution and before record/commit, which is atypical
         // compared to BankingStage which holds account locks until record + commit to avoid race conditions with
@@ -344,41 +309,28 @@ pub fn load_and_execute_bundle<'a>(
             bank.prepare_sequential_sanitized_batch_with_results(chunk)
         };
 
-        // If this is not a fifo batch, then bail on any failed locks. Note that
-        // if this is not fifo then we only support single transaction batches
-        // (as multi transactions may self conflict with write locks).
-        if !fifo && batch.lock_results().iter().any(|lock| lock.is_err()) {
-            return LoadAndExecuteBundleOutput {
-                bundle_transaction_results,
-                metrics,
-                result: Err(LoadAndExecuteBundleError::AccountInUse),
-            };
-        }
-
         debug!(
             "bundle: {} batch num locks ok: {}",
-            sanitized_bundle.bundle_id,
+            bundle.bundle_id,
             batch.lock_results().iter().filter(|lr| lr.is_ok()).count()
         );
 
-        // Ensures that bundle lock results only return either:
-        // Ok(()) | Err(TransactionError::AccountInUse)
-        // If the error isn't one of those, then error out
-        if let Some((transaction, lock_failure)) = batch.check_bundle_lock_results() {
-            debug!(
-                "bundle: {} lock error; signature: {} error: {}",
-                sanitized_bundle.bundle_id,
-                transaction.signature(),
-                lock_failure
-            );
-            return LoadAndExecuteBundleOutput {
-                bundle_transaction_results,
-                metrics,
-                result: Err(LoadAndExecuteBundleError::LockError {
-                    signature: *transaction.signature(),
-                    transaction_error: lock_failure.clone(),
-                }),
-            };
+        // Bundle locking failed if lock result returns something other than ok or AccountInUse
+        for (sanitied_tx, lock_result) in batch
+            .sanitized_transactions()
+            .iter()
+            .zip(batch.lock_results())
+        {
+            if !matches!(lock_result, Ok(()) | Err(TransactionError::AccountInUse)) {
+                return LoadAndExecuteBundleOutput {
+                    bundle_transaction_results,
+                    metrics,
+                    result: Err(LoadAndExecuteBundleError::LockError {
+                        signature: *sanitied_tx.signature(),
+                        transaction_error: lock_result.as_ref().unwrap_err().clone(),
+                    }),
+                };
+            }
         }
 
         let mut pre_balance_info = PreBalanceInfo::default();
@@ -405,11 +357,12 @@ pub fn load_and_execute_bundle<'a>(
             get_account_transactions(bank, account_overrides, accounts_requested, &batch);
         saturating_add_assign!(metrics.collect_pre_post_accounts_us, m.end_as_us());
 
-        let (mut load_and_execute_transactions_output, load_execute_us) = measure_us!(bank
+        let (load_and_execute_transactions_output, load_execute_us) = measure_us!(bank
             .load_and_execute_transactions(
                 &batch,
                 max_age,
                 &mut metrics.execute_timings,
+                &mut metrics.errors,
                 TransactionProcessingConfig {
                     account_overrides: Some(account_overrides),
                     check_program_modification_slot: bank.check_program_modification_slot(),
@@ -424,7 +377,7 @@ pub fn load_and_execute_bundle<'a>(
             ));
         debug!(
             "bundle id: {} loaded_transactions: {:?}",
-            sanitized_bundle.bundle_id, load_and_execute_transactions_output.loaded_transactions
+            bundle.bundle_id, load_and_execute_transactions_output.processing_results
         );
         saturating_add_assign!(metrics.load_execute_us, load_execute_us);
 
@@ -433,7 +386,7 @@ pub fn load_and_execute_bundle<'a>(
         // unexpected failures (not locking related), bail out of bundle execution early.
         if let Err((failing_tx, exec_result)) = check_bundle_execution_results(
             load_and_execute_transactions_output
-                .execution_results
+                .processing_results
                 .as_slice(),
             batch.sanitized_transactions(),
         ) {
@@ -444,7 +397,7 @@ pub fn load_and_execute_bundle<'a>(
             //  we'll get the results for A_1 but not [A_2], [B], [C] due to the way this loop executes.
             debug!(
                 "bundle: {} execution error; signature: {} error: {:?}",
-                sanitized_bundle.bundle_id,
+                bundle.bundle_id,
                 failing_tx.signature(),
                 exec_result
             );
@@ -461,14 +414,14 @@ pub fn load_and_execute_bundle<'a>(
         // If none of the transactions were executed, most likely an AccountInUse error
         // need to retry to ensure that all transactions in the bundle are executed.
         if !load_and_execute_transactions_output
-            .execution_results
+            .processing_results
             .iter()
-            .any(|r| r.was_executed())
+            .any(|r| r.is_ok())
         {
             saturating_add_assign!(metrics.num_retries, 1);
             debug!(
                 "bundle: {} no transaction executed, retrying",
-                sanitized_bundle.bundle_id
+                bundle.bundle_id
             );
             continue;
         }
@@ -479,17 +432,10 @@ pub fn load_and_execute_bundle<'a>(
         // NOTE: collect_accounts_to_store does not handle any state changes related to
         // failed, non-nonce transactions.
         let m = Measure::start("cache");
-
-        let ((last_blockhash, lamports_per_signature), _last_blockhash_us) =
-            measure_us!(bank.last_blockhash_and_lamports_per_signature());
-        let durable_nonce = DurableNonce::from_blockhash(&last_blockhash);
-
-        let accounts = Accounts::collect_accounts_to_store(
+        let accounts = collect_accounts_to_store(
             batch.sanitized_transactions(),
-            &load_and_execute_transactions_output.execution_results,
-            &mut load_and_execute_transactions_output.loaded_transactions,
-            &durable_nonce,
-            lamports_per_signature,
+            &None::<Vec<SanitizedTransaction>>,
+            &load_and_execute_transactions_output.processing_results,
         )
         .0;
         for (pubkey, data) in accounts {
@@ -552,7 +498,7 @@ fn get_account_transactions(
     bank: &Bank,
     account_overrides: &AccountOverrides,
     accounts: &[Option<Vec<Pubkey>>],
-    batch: &TransactionBatch,
+    batch: &TransactionBatch<SanitizedTransaction>,
 ) -> Vec<Option<Vec<(Pubkey, AccountSharedData)>>> {
     let iter = izip!(batch.lock_results().iter(), accounts.iter());
 
@@ -577,18 +523,23 @@ fn get_account_transactions(
 #[cfg(test)]
 mod tests {
     use {
-        crate::bundle_execution::{load_and_execute_bundle, LoadAndExecuteBundleError},
+        crate::{
+            bundle_execution::{load_and_execute_bundle, LoadAndExecuteBundleError},
+            derive_bundle_id_from_sanitized_transactions, SanitizedBundle,
+        },
         assert_matches::assert_matches,
         solana_ledger::genesis_utils::create_genesis_config,
         solana_runtime::{bank::Bank, bank_forks::BankForks, genesis_utils::GenesisConfigInfo},
         solana_sdk::{
-            bundle::{derive_bundle_id_from_sanitized_transactions, SanitizedBundle},
             clock::MAX_PROCESSING_AGE,
             pubkey::Pubkey,
             signature::{Keypair, Signer},
             system_transaction::transfer,
-            transaction::{SanitizedTransaction, Transaction, TransactionError},
+            transaction::{
+                SanitizedTransaction, Transaction, TransactionError, VersionedTransaction,
+            },
         },
+        solana_svm::transaction_processing_result::TransactionProcessingResultExtensions,
         std::{
             sync::{Arc, Barrier, RwLock},
             thread::{sleep, spawn},
@@ -609,16 +560,10 @@ mod tests {
         (genesis_config_info, bank, bank_forks)
     }
 
-    fn make_bundle(txs: &[Transaction], bank: &Bank) -> SanitizedBundle {
+    fn make_bundle(txs: &[Transaction]) -> SanitizedBundle {
         let transactions: Vec<_> = txs
             .iter()
-            .map(|tx| {
-                SanitizedTransaction::try_from_legacy_transaction(
-                    tx.clone(),
-                    bank.get_reserved_account_keys(),
-                )
-                .unwrap()
-            })
+            .map(|tx| SanitizedTransaction::from_transaction_for_tests(tx.clone()))
             .collect();
 
         let bundle_id = derive_bundle_id_from_sanitized_transactions(&transactions);
@@ -653,12 +598,11 @@ mod tests {
             TRANSFER_AMOUNT,
             genesis_config_info.genesis_config.hash(),
         )];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
         let default_accounts = vec![None; bundle.transactions.len()];
 
         let execution_result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &MAX_PROCESSING_TIME,
@@ -668,7 +612,6 @@ mod tests {
             None,
             &default_accounts,
             &default_accounts,
-            true,
         );
 
         // make sure the bundle succeeded
@@ -678,23 +621,29 @@ mod tests {
         assert_eq!(execution_result.bundle_transaction_results.len(), 1);
         let tx_result = execution_result.bundle_transaction_results.first().unwrap();
         assert_eq!(tx_result.transactions.len(), 1);
-        assert_eq!(tx_result.transactions[0], bundle.transactions[0]);
+        assert_eq!(
+            tx_result.transactions[0].to_versioned_transaction(),
+            bundle.transactions[0].to_versioned_transaction()
+        );
 
         // make sure the transaction executed successfully
         assert_eq!(
             tx_result
                 .load_and_execute_transactions_output
-                .execution_results
+                .processing_results
                 .len(),
             1
         );
         let execution_result = tx_result
             .load_and_execute_transactions_output
-            .execution_results
+            .processing_results
             .first()
             .unwrap();
-        assert!(execution_result.was_executed());
-        assert!(execution_result.was_executed_successfully());
+        assert!(execution_result.is_ok());
+        let processed = execution_result.as_ref().unwrap().executed_transaction();
+        assert!(processed.is_some());
+        let executed = processed.unwrap();
+        assert!(executed.was_successful());
 
         // Make sure the post-balances are correct
         assert_eq!(tx_result.pre_balance_info.native.len(), 1);
@@ -730,12 +679,11 @@ mod tests {
             TRANSFER_AMOUNT,
             genesis_config_info.genesis_config.hash(),
         )];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let default_accounts = vec![None; bundle.transactions.len()];
         let execution_result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &MAX_PROCESSING_TIME,
@@ -745,7 +693,6 @@ mod tests {
             None,
             &default_accounts,
             &default_accounts,
-            true,
         );
 
         assert_eq!(execution_result.bundle_transaction_results.len(), 0);
@@ -755,8 +702,7 @@ mod tests {
         match execution_result.result.unwrap_err() {
             LoadAndExecuteBundleError::ProcessingTimeExceeded(_)
             | LoadAndExecuteBundleError::LockError { .. }
-            | LoadAndExecuteBundleError::InvalidPreOrPostAccounts
-            | LoadAndExecuteBundleError::AccountInUse => {
+            | LoadAndExecuteBundleError::InvalidPreOrPostAccounts => {
                 unreachable!();
             }
             LoadAndExecuteBundleError::TransactionError {
@@ -764,7 +710,10 @@ mod tests {
                 execution_result,
             } => {
                 assert_eq!(signature, *bundle.transactions[0].signature());
-                assert!(!execution_result.was_executed());
+                assert_eq!(
+                    execution_result.unwrap_err(),
+                    TransactionError::AccountNotFound
+                );
             }
         }
     }
@@ -808,12 +757,11 @@ mod tests {
                 genesis_config_info.genesis_config.hash(),
             ),
         ];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let default_accounts = vec![None; bundle.transactions.len()];
         let execution_result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &MAX_PROCESSING_TIME,
@@ -823,39 +771,62 @@ mod tests {
             None,
             &default_accounts,
             &default_accounts,
-            true,
         );
 
-        assert!(execution_result.result.is_ok());
+        assert!(
+            execution_result.result.is_ok(),
+            "{:?}",
+            execution_result.result
+        );
         assert_eq!(execution_result.bundle_transaction_results.len(), 3);
 
         // first batch contains the first tx that was executed
         assert_eq!(
-            execution_result.bundle_transaction_results[0].transactions,
-            bundle.transactions
+            execution_result.bundle_transaction_results[0]
+                .transactions
+                .iter()
+                .map(|r| r.to_versioned_transaction())
+                .collect::<Vec<VersionedTransaction>>(),
+            bundle
+                .transactions
+                .iter()
+                .map(|r| r.to_versioned_transaction())
+                .collect::<Vec<VersionedTransaction>>()
         );
         assert_eq!(
             execution_result.bundle_transaction_results[0]
                 .load_and_execute_transactions_output
-                .execution_results
+                .processing_results
                 .len(),
             3
         );
-        assert!(execution_result.bundle_transaction_results[0]
+        assert!(execution_result
+            .bundle_transaction_results
+            .first()
+            .unwrap()
             .load_and_execute_transactions_output
-            .execution_results[0]
-            .was_executed_successfully());
+            .processing_results
+            .first()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status()
+            .is_ok());
         assert_eq!(
             execution_result.bundle_transaction_results[0]
                 .load_and_execute_transactions_output
-                .execution_results[1]
+                .processing_results
+                .get(1)
+                .unwrap()
                 .flattened_result(),
             Err(TransactionError::AccountInUse)
         );
         assert_eq!(
             execution_result.bundle_transaction_results[0]
                 .load_and_execute_transactions_output
-                .execution_results[2]
+                .processing_results
+                .get(2)
+                .unwrap()
                 .flattened_result(),
             Err(TransactionError::AccountInUse)
         );
@@ -897,24 +868,36 @@ mod tests {
         assert_eq!(
             execution_result.bundle_transaction_results[1]
                 .transactions
-                .to_owned(),
+                .iter()
+                .map(|r| r.to_versioned_transaction())
+                .collect::<Vec<VersionedTransaction>>(),
             bundle.transactions[1..]
+                .iter()
+                .map(|r| r.to_versioned_transaction())
+                .collect::<Vec<VersionedTransaction>>()
         );
         assert_eq!(
             execution_result.bundle_transaction_results[1]
                 .load_and_execute_transactions_output
-                .execution_results
+                .processing_results
                 .len(),
             2
         );
         assert!(execution_result.bundle_transaction_results[1]
             .load_and_execute_transactions_output
-            .execution_results[0]
-            .was_executed_successfully());
+            .processing_results
+            .first()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status()
+            .is_ok());
         assert_eq!(
             execution_result.bundle_transaction_results[1]
                 .load_and_execute_transactions_output
-                .execution_results[1]
+                .processing_results
+                .get(1)
+                .unwrap()
                 .flattened_result(),
             Err(TransactionError::AccountInUse)
         );
@@ -955,20 +938,30 @@ mod tests {
         assert_eq!(
             execution_result.bundle_transaction_results[2]
                 .transactions
-                .to_owned(),
+                .iter()
+                .map(|r| r.to_versioned_transaction())
+                .collect::<Vec<VersionedTransaction>>(),
             bundle.transactions[2..]
+                .iter()
+                .map(|r| r.to_versioned_transaction())
+                .collect::<Vec<VersionedTransaction>>(),
         );
         assert_eq!(
             execution_result.bundle_transaction_results[2]
                 .load_and_execute_transactions_output
-                .execution_results
+                .processing_results
                 .len(),
             1
         );
         assert!(execution_result.bundle_transaction_results[2]
             .load_and_execute_transactions_output
-            .execution_results[0]
-            .was_executed_successfully());
+            .processing_results
+            .first()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status()
+            .is_ok());
 
         assert_eq!(
             execution_result.bundle_transaction_results[2]
@@ -1032,12 +1025,11 @@ mod tests {
                 genesis_config_info.genesis_config.hash(),
             ),
         ];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let default_accounts = vec![None; bundle.transactions.len()];
         let execution_result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &MAX_PROCESSING_TIME,
@@ -1047,13 +1039,11 @@ mod tests {
             None,
             &default_accounts,
             &default_accounts,
-            true,
         );
         match execution_result.result.as_ref().unwrap_err() {
             LoadAndExecuteBundleError::ProcessingTimeExceeded(_)
             | LoadAndExecuteBundleError::LockError { .. }
-            | LoadAndExecuteBundleError::InvalidPreOrPostAccounts
-            | LoadAndExecuteBundleError::AccountInUse => {
+            | LoadAndExecuteBundleError::InvalidPreOrPostAccounts => {
                 unreachable!();
             }
 
@@ -1084,7 +1074,7 @@ mod tests {
             1,
             genesis_config_info.genesis_config.hash(),
         )];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let locked_transfer = vec![SanitizedTransaction::from_transaction_for_tests(transfer(
             &genesis_config_info.mint_keypair,
@@ -1099,7 +1089,6 @@ mod tests {
         let default = vec![None; bundle.transactions.len()];
         let result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &Duration::from_millis(100),
@@ -1109,7 +1098,6 @@ mod tests {
             None,
             &default,
             &default,
-            true,
         );
         assert_matches!(
             result.result,
@@ -1129,7 +1117,7 @@ mod tests {
             1,
             genesis_config_info.genesis_config.hash(),
         )];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let locked_transfer = vec![SanitizedTransaction::from_transaction_for_tests(transfer(
             &genesis_config_info.mint_keypair,
@@ -1144,7 +1132,6 @@ mod tests {
         let default = vec![None; bundle.transactions.len()];
         let result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &Duration::from_millis(100),
@@ -1154,7 +1141,6 @@ mod tests {
             None,
             &default,
             &default,
-            true,
         );
         assert!(result.result.is_ok());
     }
@@ -1175,7 +1161,7 @@ mod tests {
             1,
             genesis_config_info.genesis_config.hash(),
         )];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let locked_transfer = vec![SanitizedTransaction::from_transaction_for_tests(transfer(
             &genesis_config_info.mint_keypair,
@@ -1202,7 +1188,6 @@ mod tests {
         let default = vec![None; bundle.transactions.len()];
         let result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &Duration::from_secs(2),
@@ -1212,7 +1197,6 @@ mod tests {
             None,
             &default,
             &default,
-            true,
         );
         assert!(result.result.is_ok());
 
@@ -1233,11 +1217,10 @@ mod tests {
             1,
             genesis_config_info.genesis_config.hash(),
         )];
-        let bundle = make_bundle(&transactions, &bank);
+        let bundle = make_bundle(&transactions);
 
         let result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &Duration::from_millis(100),
@@ -1247,7 +1230,6 @@ mod tests {
             None,
             &PRE_EXECUTION_ACCOUNTS,
             &vec![None; bundle.transactions.len()],
-            true,
         );
         assert_matches!(
             result.result,
@@ -1256,7 +1238,6 @@ mod tests {
 
         let result = load_and_execute_bundle(
             &bank,
-            None,
             &bundle,
             MAX_PROCESSING_AGE,
             &Duration::from_millis(100),
@@ -1266,7 +1247,6 @@ mod tests {
             None,
             &vec![None; bundle.transactions.len()],
             &PRE_EXECUTION_ACCOUNTS,
-            true,
         );
         assert_matches!(
             result.result,

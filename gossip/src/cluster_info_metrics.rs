@@ -146,14 +146,12 @@ pub struct GossipStats {
     pub(crate) packets_sent_push_messages_count: Counter,
     pub(crate) process_gossip_packets_time: Counter,
     pub(crate) process_prune: Counter,
-    pub(crate) process_pull_requests: Counter,
     pub(crate) process_pull_response: Counter,
     pub(crate) process_pull_response_count: Counter,
     pub(crate) process_pull_response_fail_insert: Counter,
     pub(crate) process_pull_response_fail_timeout: Counter,
     pub(crate) process_pull_response_len: Counter,
     pub(crate) process_pull_response_success: Counter,
-    pub(crate) process_pull_response_timeout: Counter,
     pub(crate) process_push_message: Counter,
     pub(crate) prune_message_count: Counter,
     pub(crate) prune_message_len: Counter,
@@ -312,11 +310,6 @@ pub(crate) fn submit_gossip_stats(
             i64
         ),
         (
-            "process_pull_resp_timeout",
-            stats.process_pull_response_timeout.clear(),
-            i64
-        ),
-        (
             "num_redundant_pull_responses",
             crds_stats.num_redundant_pull_responses,
             i64
@@ -332,11 +325,6 @@ pub(crate) fn submit_gossip_stats(
         (
             "process_pull_resp_len",
             stats.process_pull_response_len.clear(),
-            i64
-        ),
-        (
-            "process_pull_requests",
-            stats.process_pull_requests.clear(),
             i64
         ),
         (

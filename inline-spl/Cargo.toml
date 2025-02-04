@@ -11,7 +11,9 @@ edition = { workspace = true }
 
 [dependencies]
 bytemuck = { workspace = true }
-solana-sdk = { workspace = true }
+solana-pubkey = { workspace = true, default-features = false, features = [
+    "bytemuck",
+] }
 
 [lib]
 crate-type = ["lib"]
@@ -21,6 +23,3 @@ name = "solana_inline_spl"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
-
-[build-dependencies]
-rustc_version = { workspace = true }

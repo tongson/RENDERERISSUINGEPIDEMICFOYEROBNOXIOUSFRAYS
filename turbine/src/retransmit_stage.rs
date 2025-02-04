@@ -17,14 +17,21 @@ use {
     solana_measure::measure::Measure,
     solana_perf::deduper::Deduper,
     solana_rayon_threadlimit::get_thread_count,
-    solana_rpc::{max_slots::MaxSlots, rpc_subscriptions::RpcSubscriptions},
+    solana_rpc::{
+        max_slots::MaxSlots, rpc_subscriptions::RpcSubscriptions,
+        slot_status_notifier::SlotStatusNotifier,
+    },
     solana_rpc_client_api::response::SlotUpdate,
-    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime::{
+        bank::{Bank, MAX_LEADER_SCHEDULE_STAKES},
+        bank_forks::BankForks,
+    },
     solana_sdk::{clock::Slot, pubkey::Pubkey, timing::timestamp},
     solana_streamer::{
         sendmmsg::{multi_target_send, SendPktsError},
         socket::SocketAddrSpace,
     },
+    static_assertions::const_assert_eq,
     std::{
         collections::HashMap,
         iter::repeat,
@@ -47,7 +54,8 @@ const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 // Minimum number of shreds to use rayon parallel iterators.
 const PAR_ITER_MIN_NUM_SHREDS: usize = 2;
 
-const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = 8;
+const_assert_eq!(CLUSTER_NODES_CACHE_NUM_EPOCH_CAP, 5);
+const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = MAX_LEADER_SCHEDULE_STAKES as usize;
 const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
@@ -179,6 +187,7 @@ fn retransmit(
     shred_deduper: &mut ShredDeduper<2>,
     max_slots: &MaxSlots,
     rpc_subscriptions: Option<&RpcSubscriptions>,
+    slot_status_notifier: Option<&SlotStatusNotifier>,
     shred_receiver_address: &Arc<RwLock<Option<SocketAddr>>>,
 ) -> Result<(), RecvTimeoutError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -262,9 +271,8 @@ fn retransmit(
                     stats,
                     &shred_receiver_address.read().unwrap(),
                 )
-                .map_err(|err| {
-                    stats.record_error(&err);
-                    err
+                .inspect_err(|err| {
+                    stats.record_error(err);
                 })
                 .ok()?;
                 Some((key.slot(), root_distance, num_nodes))
@@ -288,9 +296,8 @@ fn retransmit(
                         stats,
                         &shred_receiver_address.read().unwrap(),
                     )
-                    .map_err(|err| {
-                        stats.record_error(&err);
-                        err
+                    .inspect_err(|err| {
+                        stats.record_error(err);
                     })
                     .ok()?;
                     Some((key.slot(), root_distance, num_nodes))
@@ -299,7 +306,12 @@ fn retransmit(
                 .reduce(HashMap::new, RetransmitSlotStats::merge)
         })
     };
-    stats.upsert_slot_stats(slot_stats, root_bank.slot(), rpc_subscriptions);
+    stats.upsert_slot_stats(
+        slot_stats,
+        root_bank.slot(),
+        rpc_subscriptions,
+        slot_status_notifier,
+    );
     timer_start.stop();
     stats.total_time += timer_start.as_us();
     stats.maybe_submit(&root_bank, &working_bank, cluster_info, cluster_nodes_cache);
@@ -378,6 +390,7 @@ fn retransmit_shred(
 /// * `leader_schedule_cache` - The leader schedule to verify shreds
 /// * `cluster_info` - This structure needs to be updated and populated by the bank and via gossip.
 /// * `r` - Receive channel for shreds to be retransmitted to all the layer 1 nodes.
+#[allow(clippy::too_many_arguments)]
 pub fn retransmitter(
     sockets: Arc<Vec<UdpSocket>>,
     quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
@@ -387,6 +400,7 @@ pub fn retransmitter(
     shreds_receiver: Receiver<Vec</*shred:*/ Vec<u8>>>,
     max_slots: Arc<MaxSlots>,
     rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
+    slot_status_notifier: Option<SlotStatusNotifier>,
     shred_receiver_addr: Arc<RwLock<Option<SocketAddr>>>,
 ) -> JoinHandle<()> {
     let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
@@ -419,6 +433,7 @@ pub fn retransmitter(
                 &mut shred_deduper,
                 &max_slots,
                 rpc_subscriptions.as_deref(),
+                slot_status_notifier.as_ref(),
                 &shred_receiver_addr,
             ) {
                 Ok(()) => (),
@@ -434,6 +449,7 @@ pub struct RetransmitStage {
 }
 
 impl RetransmitStage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bank_forks: Arc<RwLock<BankForks>>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
@@ -443,6 +459,7 @@ impl RetransmitStage {
         retransmit_receiver: Receiver<Vec</*shred:*/ Vec<u8>>>,
         max_slots: Arc<MaxSlots>,
         rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
+        slot_status_notifier: Option<SlotStatusNotifier>,
         shred_receiver_addr: Arc<RwLock<Option<SocketAddr>>>,
     ) -> Self {
         let retransmit_thread_handle = retransmitter(
@@ -454,6 +471,7 @@ impl RetransmitStage {
             retransmit_receiver,
             max_slots,
             rpc_subscriptions,
+            slot_status_notifier,
             shred_receiver_addr,
         );
 
@@ -517,6 +535,7 @@ impl RetransmitStats {
         feed: I,
         root: Slot,
         rpc_subscriptions: Option<&RpcSubscriptions>,
+        slot_status_notifier: Option<&SlotStatusNotifier>,
     ) where
         I: IntoIterator<Item = (Slot, RetransmitSlotStats)>,
     {
@@ -533,6 +552,16 @@ impl RetransmitStats {
                             datapoint_info!("retransmit-first-shred", ("slot", slot, i64));
                         }
                     }
+
+                    if let Some(slot_status_notifier) = slot_status_notifier {
+                        if slot > root {
+                            slot_status_notifier
+                                .read()
+                                .unwrap()
+                                .notify_first_shred_received(slot);
+                        }
+                    }
+
                     self.slot_stats.put(slot, slot_stats);
                 }
                 Some(entry) => {

@@ -1,5 +1,6 @@
 use {
     crate::{
+        account_locks::{validate_account_locks, AccountLocks},
         accounts_db::{
             AccountStorageEntry, AccountsAddRootTiming, AccountsDb, LoadHint, LoadedAccount,
             ScanAccountStorageData, ScanStorageResult, VerifyAccountsHashAndLamportsConfig,
@@ -12,29 +13,20 @@ use {
     log::*,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
-        account_utils::StateMut,
         address_lookup_table::{self, error::AddressLookupError, state::AddressLookupTable},
         clock::{BankId, Slot},
-        message::{
-            v0::{LoadedAddresses, MessageAddressTableLookup},
-            SanitizedMessage,
-        },
-        nonce::{
-            state::{DurableNonce, Versions as NonceVersions},
-            State as NonceState,
-        },
+        message::v0::LoadedAddresses,
         pubkey::Pubkey,
         slot_hashes::SlotHashes,
-        transaction::{Result, SanitizedTransaction, TransactionAccountLocks, TransactionError},
+        transaction::{Result, SanitizedTransaction, TransactionError},
         transaction_context::TransactionAccount,
     },
-    solana_svm::{
-        account_loader::TransactionLoadResult, nonce_info::NonceInfo,
-        rollback_accounts::RollbackAccounts, transaction_results::TransactionExecutionResult,
+    solana_svm_transaction::{
+        message_address_table_lookup::SVMMessageAddressTableLookup, svm_message::SVMMessage,
     },
     std::{
         cmp::Reverse,
-        collections::{hash_map, BinaryHeap, HashMap, HashSet},
+        collections::{BinaryHeap, HashSet},
         ops::RangeBounds,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -45,61 +37,27 @@ use {
 
 pub type PubkeyAccountSlot = (Pubkey, AccountSharedData, Slot);
 
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Debug, Default)]
-pub struct AccountLocks {
-    write_locks: HashSet<Pubkey>,
-    readonly_locks: HashMap<Pubkey, u64>,
+pub struct TransactionAccountLocksIterator<'a, T: SVMMessage> {
+    transaction: &'a T,
 }
 
-impl AccountLocks {
-    fn is_locked_readonly(&self, key: &Pubkey) -> bool {
-        self.readonly_locks
-            .get(key)
-            .map_or(false, |count| *count > 0)
+impl<'a, T: SVMMessage> TransactionAccountLocksIterator<'a, T> {
+    pub fn new(transaction: &'a T) -> Self {
+        Self { transaction }
     }
 
-    fn is_locked_write(&self, key: &Pubkey) -> bool {
-        self.write_locks.contains(key)
-    }
-
-    fn insert_new_readonly(&mut self, key: &Pubkey) {
-        assert!(self.readonly_locks.insert(*key, 1).is_none());
-    }
-
-    fn lock_readonly(&mut self, key: &Pubkey) -> bool {
-        self.readonly_locks.get_mut(key).map_or(false, |count| {
-            *count += 1;
-            true
-        })
-    }
-
-    fn unlock_readonly(&mut self, key: &Pubkey) {
-        if let hash_map::Entry::Occupied(mut occupied_entry) = self.readonly_locks.entry(*key) {
-            let count = occupied_entry.get_mut();
-            *count -= 1;
-            if *count == 0 {
-                occupied_entry.remove_entry();
-            }
-        } else {
-            debug_assert!(
-                false,
-                "Attempted to remove a read-lock for a key that wasn't read-locked"
-            );
-        }
-    }
-
-    fn unlock_write(&mut self, key: &Pubkey) {
-        let removed = self.write_locks.remove(key);
-        debug_assert!(
-            removed,
-            "Attempted to remove a write-lock for a key that wasn't write-locked"
-        );
+    pub(crate) fn accounts_with_is_writable(
+        &self,
+    ) -> impl Iterator<Item = (&'a Pubkey, bool)> + Clone {
+        self.transaction
+            .account_keys()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key, self.transaction.is_writable(index)))
     }
 }
 
 /// This structure handles synchronization for db
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 #[derive(Debug)]
 pub struct Accounts {
     /// Single global AccountsDb
@@ -128,12 +86,31 @@ impl Accounts {
     pub fn load_lookup_table_addresses(
         &self,
         ancestors: &Ancestors,
-        address_table_lookup: &MessageAddressTableLookup,
+        address_table_lookup: SVMMessageAddressTableLookup,
         slot_hashes: &SlotHashes,
     ) -> std::result::Result<(LoadedAddresses, Slot), AddressLookupError> {
+        let mut loaded_addresses = LoadedAddresses::default();
+        self.load_lookup_table_addresses_into(
+            ancestors,
+            address_table_lookup,
+            slot_hashes,
+            &mut loaded_addresses,
+        )
+        .map(|deactivation_slot| (loaded_addresses, deactivation_slot))
+    }
+
+    /// Fill `loaded_addresses` and return the deactivation slot.
+    /// If no tables are de-activating, the deactivation slot is `u64::MAX`.
+    pub fn load_lookup_table_addresses_into(
+        &self,
+        ancestors: &Ancestors,
+        address_table_lookup: SVMMessageAddressTableLookup,
+        slot_hashes: &SlotHashes,
+        loaded_addresses: &mut LoadedAddresses,
+    ) -> std::result::Result<Slot, AddressLookupError> {
         let table_account = self
             .accounts_db
-            .load_with_fixed_root(ancestors, &address_table_lookup.account_key)
+            .load_with_fixed_root(ancestors, address_table_lookup.account_key)
             .map(|(account, _rent)| account)
             .ok_or(AddressLookupError::LookupTableAccountNotFound)?;
 
@@ -142,26 +119,46 @@ impl Accounts {
             let lookup_table = AddressLookupTable::deserialize(table_account.data())
                 .map_err(|_ix_err| AddressLookupError::InvalidAccountData)?;
 
-            Ok((
-                LoadedAddresses {
-                    writable: lookup_table.lookup(
-                        current_slot,
-                        &address_table_lookup.writable_indexes,
-                        slot_hashes,
-                    )?,
-                    readonly: lookup_table.lookup(
-                        current_slot,
-                        &address_table_lookup.readonly_indexes,
-                        slot_hashes,
-                    )?,
-                },
-                lookup_table.meta.deactivation_slot,
-            ))
+            // Load iterators for addresses.
+            let writable_addresses = lookup_table.lookup_iter(
+                current_slot,
+                address_table_lookup.writable_indexes,
+                slot_hashes,
+            )?;
+            let readonly_addresses = lookup_table.lookup_iter(
+                current_slot,
+                address_table_lookup.readonly_indexes,
+                slot_hashes,
+            )?;
+
+            // Reserve space in vectors to avoid reallocations.
+            // If `loaded_addresses` is pre-allocated, this only does a simple
+            // bounds check.
+            loaded_addresses
+                .writable
+                .reserve(address_table_lookup.writable_indexes.len());
+            loaded_addresses
+                .readonly
+                .reserve(address_table_lookup.readonly_indexes.len());
+
+            // Append to the loaded addresses.
+            // Check if **any** of the addresses are not available.
+            for address in writable_addresses {
+                loaded_addresses
+                    .writable
+                    .push(address.ok_or(AddressLookupError::InvalidLookupIndex)?);
+            }
+            for address in readonly_addresses {
+                loaded_addresses
+                    .readonly
+                    .push(address.ok_or(AddressLookupError::InvalidLookupIndex)?);
+            }
+
+            Ok(lookup_table.meta.deactivation_slot)
         } else {
             Err(AddressLookupError::InvalidAccountOwner)
         }
     }
-
     /// Slow because lock is held for 1 operation instead of many
     /// This always returns None for zero-lamport accounts.
     fn load_slow(
@@ -558,75 +555,20 @@ impl Accounts {
         self.accounts_db.store_uncached(slot, &[(pubkey, account)]);
     }
 
-    fn lock_account(
-        account_locks: &mut AccountLocks,
-        writable_keys: Vec<&Pubkey>,
-        readonly_keys: Vec<&Pubkey>,
-        additional_read_locks: Option<&HashSet<Pubkey>>,
-        additional_write_locks: Option<&HashSet<Pubkey>>,
-    ) -> Result<()> {
-        for k in writable_keys.iter() {
-            if account_locks.is_locked_write(k)
-                || account_locks.is_locked_readonly(k)
-                || additional_write_locks
-                    .map(|additional_write_locks| additional_write_locks.contains(k))
-                    .unwrap_or(false)
-                || additional_read_locks
-                    .map(|additional_read_locks| additional_read_locks.contains(k))
-                    .unwrap_or(false)
-            {
-                debug!("Writable account in use: {:?}", k);
-                return Err(TransactionError::AccountInUse);
-            }
-        }
-        for k in readonly_keys.iter() {
-            if account_locks.is_locked_write(k)
-                || additional_write_locks
-                    .map(|additional_write_locks| additional_write_locks.contains(k))
-                    .unwrap_or(false)
-            {
-                debug!("Read-only account in use: {:?}", k);
-                return Err(TransactionError::AccountInUse);
-            }
-        }
-
-        for k in writable_keys {
-            account_locks.write_locks.insert(*k);
-        }
-
-        for k in readonly_keys {
-            if !account_locks.lock_readonly(k) {
-                account_locks.insert_new_readonly(k);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unlock_account(
-        &self,
-        account_locks: &mut AccountLocks,
-        writable_keys: Vec<&Pubkey>,
-        readonly_keys: Vec<&Pubkey>,
-    ) {
-        for k in writable_keys {
-            account_locks.unlock_write(k);
-        }
-        for k in readonly_keys {
-            account_locks.unlock_readonly(k);
-        }
-    }
-
     /// This function will prevent multiple threads from modifying the same account state at the
     /// same time
     #[must_use]
-    pub fn lock_accounts<'a>(
+    pub fn lock_accounts<'a, Tx: SVMMessage + 'a>(
         &self,
-        txs: impl Iterator<Item = &'a SanitizedTransaction>,
+        txs: impl Iterator<Item = &'a Tx>,
         tx_account_lock_limit: usize,
     ) -> Vec<Result<()>> {
+        // Validate the account locks, then get iterator if successful validation.
         let tx_account_locks_results: Vec<Result<_>> = txs
-            .map(|tx| tx.get_account_locks(tx_account_lock_limit))
+            .map(|tx| {
+                validate_account_locks(tx.account_keys(), tx_account_lock_limit)
+                    .map(|_| TransactionAccountLocksIterator::new(tx))
+            })
             .collect();
         self.lock_accounts_inner(tx_account_locks_results, None, None)
     }
@@ -634,16 +576,18 @@ impl Accounts {
     #[must_use]
     pub fn lock_accounts_with_results<'a>(
         &self,
-        txs: impl Iterator<Item = &'a SanitizedTransaction>,
+        txs: impl Iterator<Item = &'a (impl SVMMessage + 'a)>,
         results: impl Iterator<Item = Result<()>>,
         tx_account_lock_limit: usize,
         additional_read_locks: Option<&HashSet<Pubkey>>,
         additional_write_locks: Option<&HashSet<Pubkey>>,
     ) -> Vec<Result<()>> {
+        // Validate the account locks, then get iterator if successful validation.
         let tx_account_locks_results: Vec<Result<_>> = txs
             .zip(results)
             .map(|(tx, result)| match result {
-                Ok(()) => tx.get_account_locks(tx_account_lock_limit),
+                Ok(()) => validate_account_locks(tx.account_keys(), tx_account_lock_limit)
+                    .map(|_| TransactionAccountLocksIterator::new(tx)),
                 Err(err) => Err(err),
             })
             .collect();
@@ -657,7 +601,7 @@ impl Accounts {
     #[must_use]
     fn lock_accounts_inner(
         &self,
-        tx_account_locks_results: Vec<Result<TransactionAccountLocks>>,
+        tx_account_locks_results: Vec<Result<TransactionAccountLocksIterator<impl SVMMessage>>>,
         additional_read_locks: Option<&HashSet<Pubkey>>,
         additional_write_locks: Option<&HashSet<Pubkey>>,
     ) -> Vec<Result<()>> {
@@ -665,10 +609,8 @@ impl Accounts {
         tx_account_locks_results
             .into_iter()
             .map(|tx_account_locks_result| match tx_account_locks_result {
-                Ok(tx_account_locks) => Self::lock_account(
-                    account_locks,
-                    tx_account_locks.writable,
-                    tx_account_locks.readonly,
+                Ok(tx_account_locks) => account_locks.try_lock_accounts(
+                    tx_account_locks.accounts_with_is_writable(),
                     additional_read_locks,
                     additional_write_locks,
                 ),
@@ -678,46 +620,32 @@ impl Accounts {
     }
 
     /// Once accounts are unlocked, new transactions that modify that state can enter the pipeline
-    pub fn unlock_accounts<'a>(
+    pub fn unlock_accounts<'a, Tx: SVMMessage + 'a>(
         &self,
-        txs_and_results: impl Iterator<Item = (&'a SanitizedTransaction, &'a Result<()>)>,
+        txs_and_results: impl Iterator<Item = (&'a Tx, &'a Result<()>)> + Clone,
     ) {
-        let keys: Vec<_> = txs_and_results
-            .filter(|(_, res)| res.is_ok())
-            .map(|(tx, _)| tx.get_account_locks_unchecked())
-            .collect();
-        if keys.is_empty() {
+        if !txs_and_results.clone().any(|(_, res)| res.is_ok()) {
             return;
         }
 
         let mut account_locks = self.account_locks.lock().unwrap();
         debug!("bank unlock accounts");
-        keys.into_iter().for_each(|keys| {
-            self.unlock_account(&mut account_locks, keys.writable, keys.readonly);
-        });
+        for (tx, res) in txs_and_results {
+            if res.is_ok() {
+                let tx_account_locks = TransactionAccountLocksIterator::new(tx);
+                account_locks.unlock_accounts(tx_account_locks.accounts_with_is_writable());
+            }
+        }
     }
 
     /// Store the accounts into the DB
-    // allow(clippy) needed for various gating flags
-    #[allow(clippy::too_many_arguments)]
-    pub fn store_cached(
+    pub fn store_cached<'a>(
         &self,
-        slot: Slot,
-        txs: &[SanitizedTransaction],
-        res: &[TransactionExecutionResult],
-        loaded: &mut [TransactionLoadResult],
-        durable_nonce: &DurableNonce,
-        lamports_per_signature: u64,
+        accounts: impl StorableAccounts<'a>,
+        transactions: Option<&'a [&'a SanitizedTransaction]>,
     ) {
-        let (accounts_to_store, transactions) = Self::collect_accounts_to_store(
-            txs,
-            res,
-            loaded,
-            durable_nonce,
-            lamports_per_signature,
-        );
         self.accounts_db
-            .store_cached_inline_update_index((slot, &accounts_to_store[..]), Some(&transactions));
+            .store_cached_inline_update_index(accounts, transactions);
     }
 
     pub fn store_accounts_cached<'a>(&self, accounts: impl StorableAccounts<'a>) {
@@ -729,108 +657,33 @@ impl Accounts {
         self.accounts_db.add_root(slot)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn collect_accounts_to_store<'a>(
-        txs: &'a [SanitizedTransaction],
-        execution_results: &'a [TransactionExecutionResult],
-        load_results: &'a mut [TransactionLoadResult],
-        durable_nonce: &DurableNonce,
-        lamports_per_signature: u64,
-    ) -> (
-        Vec<(&'a Pubkey, &'a AccountSharedData)>,
-        Vec<Option<&'a SanitizedTransaction>>,
-    ) {
-        let mut accounts = Vec::with_capacity(load_results.len());
-        let mut transactions = Vec::with_capacity(load_results.len());
-        for (i, (tx_load_result, tx)) in load_results.iter_mut().zip(txs).enumerate() {
-            let Ok(loaded_transaction) = tx_load_result else {
-                // Don't store any accounts if tx failed to load
-                continue;
-            };
-
-            let execution_status = match &execution_results[i] {
-                TransactionExecutionResult::Executed { details, .. } => &details.status,
-                // Don't store any accounts if tx wasn't executed
-                TransactionExecutionResult::NotExecuted(_) => continue,
-            };
-
-            // Accounts that are invoked and also not passed as an instruction
-            // account to a program don't need to be stored because it's assumed
-            // to be impossible for a committable transaction to modify an
-            // invoked account if said account isn't passed to some program.
-            //
-            // Note that this assumption might not hold in the future after
-            // SIMD-0082 is implemented because we may decide to commit
-            // transactions that incorrectly attempt to invoke a fee payer or
-            // durable nonce account. If that happens, we would NOT want to use
-            // this filter because we always NEED to store those accounts even
-            // if they aren't passed to any programs (because they are mutated
-            // outside of the VM).
-            let is_storable_account = |message: &SanitizedMessage, key_index: usize| -> bool {
-                !message.is_invoked(key_index) || message.is_instruction_account(key_index)
-            };
-
-            let message = tx.message();
-            let rollback_accounts = &loaded_transaction.rollback_accounts;
-            let maybe_nonce_address = rollback_accounts.nonce().map(|account| account.address());
-
-            for (i, (address, account)) in (0..message.account_keys().len())
-                .zip(loaded_transaction.accounts.iter_mut())
-                .filter(|(i, _)| is_storable_account(message, *i))
-            {
-                if message.is_writable(i) {
-                    let should_collect_account = match execution_status {
-                        Ok(()) => true,
-                        Err(_) => {
-                            let is_fee_payer = i == 0;
-                            let is_nonce_account = Some(&*address) == maybe_nonce_address;
-                            post_process_failed_tx(
-                                account,
-                                is_fee_payer,
-                                is_nonce_account,
-                                rollback_accounts,
-                                durable_nonce,
-                                lamports_per_signature,
-                            );
-
-                            is_fee_payer || is_nonce_account
-                        }
-                    };
-
-                    if should_collect_account {
-                        // Add to the accounts to store
-                        accounts.push((&*address, &*account));
-                        transactions.push(Some(tx));
-                    }
-                }
-            }
-        }
-        (accounts, transactions)
-    }
-
-    pub fn lock_accounts_sequential_with_results<'a>(
+    pub fn lock_accounts_sequential_with_results<Tx: SVMMessage>(
         &self,
-        txs: impl Iterator<Item = &'a SanitizedTransaction>,
+        txs: &[Tx],
         tx_account_lock_limit: usize,
     ) -> Vec<Result<()>> {
-        let tx_account_locks_results: Vec<Result<_>> = txs
-            .map(|tx| tx.get_account_locks(tx_account_lock_limit))
+        let tx_account_locks_results: Vec<_> = txs
+            .iter()
+            .map(|tx| {
+                validate_account_locks(tx.account_keys(), tx_account_lock_limit)
+                    .map(|_| TransactionAccountLocksIterator::new(tx))
+            })
             .collect();
         self.lock_accounts_sequential_inner(tx_account_locks_results)
     }
 
     #[must_use]
-    fn lock_accounts_sequential_inner(
+    fn lock_accounts_sequential_inner<Tx: SVMMessage>(
         &self,
-        tx_account_locks_results: Vec<Result<TransactionAccountLocks>>,
+        tx_account_locks_results: Vec<Result<TransactionAccountLocksIterator<Tx>>>,
     ) -> Vec<Result<()>> {
         let mut l_account_locks = self.account_locks.lock().unwrap();
         Self::lock_accounts_sequential(&mut l_account_locks, tx_account_locks_results)
     }
 
-    pub fn lock_accounts_sequential(
+    pub fn lock_accounts_sequential<Tx: SVMMessage>(
         account_locks: &mut AccountLocks,
-        tx_account_locks_results: Vec<Result<TransactionAccountLocks>>,
+        tx_account_locks_results: Vec<Result<TransactionAccountLocksIterator<Tx>>>,
     ) -> Vec<Result<()>> {
         let mut account_in_use_set = false;
         tx_account_locks_results
@@ -839,10 +692,8 @@ impl Accounts {
                 Ok(tx_account_locks) => match account_in_use_set {
                     true => Err(TransactionError::AccountInUse),
                     false => {
-                        let locked = Self::lock_account(
-                            account_locks,
-                            tx_account_locks.writable,
-                            tx_account_locks.readonly,
+                        let locked = account_locks.try_lock_accounts(
+                            tx_account_locks.accounts_with_is_writable(),
                             None,
                             None,
                         );
@@ -858,70 +709,19 @@ impl Accounts {
     }
 }
 
-fn post_process_failed_tx(
-    account: &mut AccountSharedData,
-    is_fee_payer: bool,
-    is_nonce_account: bool,
-    rollback_accounts: &RollbackAccounts,
-    &durable_nonce: &DurableNonce,
-    lamports_per_signature: u64,
-) {
-    // For the case of RollbackAccounts::SameNonceAndFeePayer, it's crucial
-    // for `is_nonce_account` to be checked earlier than `is_fee_payer`.
-    if is_nonce_account {
-        if let Some(nonce) = rollback_accounts.nonce() {
-            // The transaction failed which would normally drop the account
-            // processing changes, since this account is now being included
-            // in the accounts written back to the db, roll it back to
-            // pre-processing state.
-            *account = nonce.account().clone();
-
-            // Advance the stored blockhash to prevent fee theft by someone
-            // replaying nonce transactions that have failed with an
-            // `InstructionError`.
-            //
-            // Since we know we are dealing with a valid nonce account,
-            // unwrap is safe here
-            let nonce_versions = StateMut::<NonceVersions>::state(account).unwrap();
-            if let NonceState::Initialized(ref data) = nonce_versions.state() {
-                let nonce_state = NonceState::new_initialized(
-                    &data.authority,
-                    durable_nonce,
-                    lamports_per_signature,
-                );
-                let nonce_versions = NonceVersions::new(nonce_state);
-                account.set_state(&nonce_versions).unwrap();
-            }
-        }
-    } else if is_fee_payer {
-        *account = rollback_accounts.fee_payer_account().clone();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        assert_matches::assert_matches,
-        solana_compute_budget::compute_budget_processor::ComputeBudgetLimits,
         solana_sdk::{
             account::{AccountSharedData, WritableAccount},
             address_lookup_table::state::LookupTableMeta,
-            fee::FeeDetails,
             hash::Hash,
-            instruction::{CompiledInstruction, InstructionError},
-            message::{Message, MessageHeader},
+            instruction::CompiledInstruction,
+            message::{v0::MessageAddressTableLookup, Message, MessageHeader},
             native_loader,
-            nonce::state::Data as NonceData,
-            nonce_account,
-            rent_debits::RentDebits,
-            signature::{keypair_from_seed, signers::Signers, Keypair, Signer},
-            system_instruction, system_program,
-            transaction::{Transaction, MAX_TX_ACCOUNT_LOCKS},
-        },
-        solana_svm::{
-            account_loader::LoadedTransaction, nonce_info::NoncePartial,
-            transaction_results::TransactionExecutionDetails,
+            signature::{signers::Signers, Keypair, Signer},
+            transaction::{Transaction, TransactionError, MAX_TX_ACCOUNT_LOCKS},
         },
         std::{
             borrow::Cow,
@@ -941,21 +741,6 @@ mod tests {
             message,
             recent_blockhash,
         ))
-    }
-
-    fn new_execution_result(status: Result<()>) -> TransactionExecutionResult {
-        TransactionExecutionResult::Executed {
-            details: TransactionExecutionDetails {
-                status,
-                log_messages: None,
-                inner_instructions: None,
-                fee_details: FeeDetails::default(),
-                return_data: None,
-                executed_units: 0,
-                accounts_data_len_delta: 0,
-            },
-            programs_modified_by_tx: HashMap::new(),
-        }
     }
 
     #[test]
@@ -1030,7 +815,7 @@ mod tests {
         assert_eq!(
             accounts.load_lookup_table_addresses(
                 &ancestors,
-                &address_table_lookup,
+                SVMMessageAddressTableLookup::from(&address_table_lookup),
                 &SlotHashes::default(),
             ),
             Err(AddressLookupError::LookupTableAccountNotFound),
@@ -1057,7 +842,7 @@ mod tests {
         assert_eq!(
             accounts.load_lookup_table_addresses(
                 &ancestors,
-                &address_table_lookup,
+                SVMMessageAddressTableLookup::from(&address_table_lookup),
                 &SlotHashes::default(),
             ),
             Err(AddressLookupError::InvalidAccountOwner),
@@ -1084,7 +869,7 @@ mod tests {
         assert_eq!(
             accounts.load_lookup_table_addresses(
                 &ancestors,
-                &address_table_lookup,
+                SVMMessageAddressTableLookup::from(&address_table_lookup),
                 &SlotHashes::default(),
             ),
             Err(AddressLookupError::InvalidAccountData),
@@ -1123,7 +908,7 @@ mod tests {
         assert_eq!(
             accounts.load_lookup_table_addresses(
                 &ancestors,
-                &address_table_lookup,
+                SVMMessageAddressTableLookup::from(&address_table_lookup),
                 &SlotHashes::default(),
             ),
             Ok((
@@ -1271,16 +1056,11 @@ mod tests {
         let results0 = accounts.lock_accounts([tx.clone()].iter(), MAX_TX_ACCOUNT_LOCKS);
 
         assert_eq!(results0, vec![Ok(())]);
-        assert_eq!(
-            *accounts
-                .account_locks
-                .lock()
-                .unwrap()
-                .readonly_locks
-                .get(&keypair1.pubkey())
-                .unwrap(),
-            1
-        );
+        assert!(accounts
+            .account_locks
+            .lock()
+            .unwrap()
+            .is_locked_readonly(&keypair1.pubkey()));
 
         let instructions = vec![CompiledInstruction::new(2, &(), vec![0, 1])];
         let message = Message::new_with_compiled_instructions(
@@ -1311,16 +1091,11 @@ mod tests {
                 Err(TransactionError::AccountInUse), // Read-only account (keypair1) cannot also be locked as writable
             ],
         );
-        assert_eq!(
-            *accounts
-                .account_locks
-                .lock()
-                .unwrap()
-                .readonly_locks
-                .get(&keypair1.pubkey())
-                .unwrap(),
-            2
-        );
+        assert!(accounts
+            .account_locks
+            .lock()
+            .unwrap()
+            .is_locked_readonly(&keypair1.pubkey()));
 
         accounts.unlock_accounts(iter::once(&tx).zip(&results0));
         accounts.unlock_accounts(txs.iter().zip(&results1));
@@ -1345,8 +1120,7 @@ mod tests {
             .account_locks
             .lock()
             .unwrap()
-            .readonly_locks
-            .contains_key(&keypair1.pubkey()));
+            .is_locked_readonly(&keypair1.pubkey()));
     }
 
     #[test]
@@ -1460,29 +1234,22 @@ mod tests {
 
         assert!(results0[0].is_ok());
         // Instruction program-id account demoted to readonly
-        assert_eq!(
-            *accounts
-                .account_locks
-                .lock()
-                .unwrap()
-                .readonly_locks
-                .get(&native_loader::id())
-                .unwrap(),
-            1
-        );
+        assert!(accounts
+            .account_locks
+            .lock()
+            .unwrap()
+            .is_locked_readonly(&native_loader::id()));
         // Non-program accounts remain writable
         assert!(accounts
             .account_locks
             .lock()
             .unwrap()
-            .write_locks
-            .contains(&keypair0.pubkey()));
+            .is_locked_write(&keypair0.pubkey()));
         assert!(accounts
             .account_locks
             .lock()
             .unwrap()
-            .write_locks
-            .contains(&keypair1.pubkey()));
+            .is_locked_write(&keypair1.pubkey()));
     }
 
     impl Accounts {
@@ -1573,146 +1340,18 @@ mod tests {
             ],
         );
 
-        // verify that keypair0 read-only lock twice (for tx0 and tx2)
-        assert_eq!(
-            *accounts
-                .account_locks
-                .lock()
-                .unwrap()
-                .readonly_locks
-                .get(&keypair0.pubkey())
-                .unwrap(),
-            2
-        );
+        // verify that keypair0 read-only locked
+        assert!(accounts
+            .account_locks
+            .lock()
+            .unwrap()
+            .is_locked_readonly(&keypair0.pubkey()));
         // verify that keypair2 (for tx1) is not write-locked
         assert!(!accounts
             .account_locks
             .lock()
             .unwrap()
-            .write_locks
-            .contains(&keypair2.pubkey()));
-
-        accounts.unlock_accounts(txs.iter().zip(&results));
-
-        // check all locks to be removed
-        assert!(accounts
-            .account_locks
-            .lock()
-            .unwrap()
-            .readonly_locks
-            .is_empty());
-        assert!(accounts
-            .account_locks
-            .lock()
-            .unwrap()
-            .write_locks
-            .is_empty());
-    }
-
-    #[test]
-    fn test_collect_accounts_to_store() {
-        let keypair0 = Keypair::new();
-        let keypair1 = Keypair::new();
-        let pubkey = solana_sdk::pubkey::new_rand();
-        let account0 = AccountSharedData::new(1, 0, &Pubkey::default());
-        let account1 = AccountSharedData::new(2, 0, &Pubkey::default());
-        let account2 = AccountSharedData::new(3, 0, &Pubkey::default());
-
-        let instructions = vec![CompiledInstruction::new(2, &(), vec![0, 1])];
-        let message = Message::new_with_compiled_instructions(
-            1,
-            0,
-            2,
-            vec![keypair0.pubkey(), pubkey, native_loader::id()],
-            Hash::default(),
-            instructions,
-        );
-        let transaction_accounts0 = vec![
-            (message.account_keys[0], account0),
-            (message.account_keys[1], account2.clone()),
-        ];
-        let tx0 = new_sanitized_tx(&[&keypair0], message, Hash::default());
-
-        let instructions = vec![CompiledInstruction::new(2, &(), vec![0, 1])];
-        let message = Message::new_with_compiled_instructions(
-            1,
-            0,
-            2,
-            vec![keypair1.pubkey(), pubkey, native_loader::id()],
-            Hash::default(),
-            instructions,
-        );
-        let transaction_accounts1 = vec![
-            (message.account_keys[0], account1),
-            (message.account_keys[1], account2),
-        ];
-        let tx1 = new_sanitized_tx(&[&keypair1], message, Hash::default());
-
-        let loaded0 = Ok(LoadedTransaction {
-            accounts: transaction_accounts0,
-            program_indices: vec![],
-            fee_details: FeeDetails::default(),
-            rollback_accounts: RollbackAccounts::default(),
-            compute_budget_limits: ComputeBudgetLimits::default(),
-            rent: 0,
-            rent_debits: RentDebits::default(),
-            loaded_accounts_data_size: 0,
-        });
-
-        let loaded1 = Ok(LoadedTransaction {
-            accounts: transaction_accounts1,
-            program_indices: vec![],
-            fee_details: FeeDetails::default(),
-            rollback_accounts: RollbackAccounts::default(),
-            compute_budget_limits: ComputeBudgetLimits::default(),
-            rent: 0,
-            rent_debits: RentDebits::default(),
-            loaded_accounts_data_size: 0,
-        });
-
-        let mut loaded = vec![loaded0, loaded1];
-
-        let accounts_db = AccountsDb::new_single_for_tests();
-        let accounts = Accounts::new(Arc::new(accounts_db));
-        {
-            accounts
-                .account_locks
-                .lock()
-                .unwrap()
-                .insert_new_readonly(&pubkey);
-        }
-        let txs = vec![tx0.clone(), tx1.clone()];
-        let execution_results = vec![new_execution_result(Ok(())); 2];
-        let (collected_accounts, transactions) = Accounts::collect_accounts_to_store(
-            &txs,
-            &execution_results,
-            loaded.as_mut_slice(),
-            &DurableNonce::default(),
-            0,
-        );
-        assert_eq!(collected_accounts.len(), 2);
-        assert!(collected_accounts
-            .iter()
-            .any(|(pubkey, _account)| *pubkey == &keypair0.pubkey()));
-        assert!(collected_accounts
-            .iter()
-            .any(|(pubkey, _account)| *pubkey == &keypair1.pubkey()));
-
-        assert_eq!(transactions.len(), 2);
-        assert!(transactions.iter().any(|txn| txn.unwrap().eq(&tx0)));
-        assert!(transactions.iter().any(|txn| txn.unwrap().eq(&tx1)));
-
-        // Ensure readonly_lock reflects lock
-        assert_eq!(
-            *accounts
-                .account_locks
-                .lock()
-                .unwrap()
-                .readonly_locks
-                .get(&pubkey)
-                .unwrap(),
-            1
-        );
+            .is_locked_write(&keypair2.pubkey()));
     }
 
     #[test]
@@ -1737,320 +1376,6 @@ mod tests {
         }
         info!("done..cleaning..");
         accounts.accounts_db.clean_accounts_for_tests();
-    }
-
-    fn create_accounts_post_process_failed_tx() -> (
-        Pubkey,
-        AccountSharedData,
-        AccountSharedData,
-        DurableNonce,
-        u64,
-    ) {
-        let data = NonceVersions::new(NonceState::Initialized(NonceData::default()));
-        let account = AccountSharedData::new_data(42, &data, &system_program::id()).unwrap();
-        let mut pre_account = account.clone();
-        pre_account.set_lamports(43);
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new(&[1u8; 32]));
-        (Pubkey::default(), pre_account, account, durable_nonce, 1234)
-    }
-
-    fn run_post_process_failed_tx_test(
-        account: &mut AccountSharedData,
-        is_fee_payer: bool,
-        is_nonce_account: bool,
-        rollback_accounts: &RollbackAccounts,
-        durable_nonce: &DurableNonce,
-        lamports_per_signature: u64,
-        expect_account: &AccountSharedData,
-    ) -> bool {
-        // Verify expect_account's relationship
-        if !is_fee_payer {
-            if is_nonce_account {
-                assert_ne!(expect_account, rollback_accounts.nonce().unwrap().account());
-            } else {
-                assert_eq!(expect_account, account);
-            }
-        }
-
-        post_process_failed_tx(
-            account,
-            is_fee_payer,
-            is_nonce_account,
-            rollback_accounts,
-            durable_nonce,
-            lamports_per_signature,
-        );
-        assert_eq!(expect_account, account);
-        expect_account == account
-    }
-
-    #[test]
-    fn test_post_process_failed_tx_expected() {
-        let (pre_account_address, pre_account, mut post_account, blockhash, lamports_per_signature) =
-            create_accounts_post_process_failed_tx();
-        let rollback_accounts = RollbackAccounts::SameNonceAndFeePayer {
-            nonce: NoncePartial::new(pre_account_address, pre_account.clone()),
-        };
-
-        let mut expect_account = pre_account;
-        expect_account
-            .set_state(&NonceVersions::new(NonceState::Initialized(
-                NonceData::new(Pubkey::default(), blockhash, lamports_per_signature),
-            )))
-            .unwrap();
-
-        assert!(run_post_process_failed_tx_test(
-            &mut post_account,
-            false, // is_fee_payer
-            true,  // is_nonce_account
-            &rollback_accounts,
-            &blockhash,
-            lamports_per_signature,
-            &expect_account,
-        ));
-    }
-
-    #[test]
-    fn test_post_process_failed_tx_not_nonce_address() {
-        let (pre_account_address, pre_account, mut post_account, blockhash, lamports_per_signature) =
-            create_accounts_post_process_failed_tx();
-
-        let rollback_accounts = RollbackAccounts::SameNonceAndFeePayer {
-            nonce: NoncePartial::new(pre_account_address, pre_account.clone()),
-        };
-
-        let expect_account = post_account.clone();
-        assert!(run_post_process_failed_tx_test(
-            &mut post_account,
-            false, // is_fee_payer
-            false, // is_nonce_account
-            &rollback_accounts,
-            &blockhash,
-            lamports_per_signature,
-            &expect_account,
-        ));
-    }
-
-    #[test]
-    fn test_rollback_nonce_fee_payer() {
-        let nonce_account = AccountSharedData::new_data(1, &(), &system_program::id()).unwrap();
-        let pre_fee_payer_account =
-            AccountSharedData::new_data(42, &(), &system_program::id()).unwrap();
-        let post_fee_payer_account =
-            AccountSharedData::new_data(84, &[1, 2, 3, 4], &system_program::id()).unwrap();
-        let rollback_accounts = RollbackAccounts::SeparateNonceAndFeePayer {
-            nonce: NoncePartial::new(Pubkey::new_unique(), nonce_account),
-            fee_payer_account: pre_fee_payer_account.clone(),
-        };
-
-        assert!(run_post_process_failed_tx_test(
-            &mut post_fee_payer_account.clone(),
-            false, // is_fee_payer
-            false, // is_nonce_account
-            &rollback_accounts,
-            &DurableNonce::default(),
-            1,
-            &post_fee_payer_account,
-        ));
-
-        assert!(run_post_process_failed_tx_test(
-            &mut post_fee_payer_account.clone(),
-            true,  // is_fee_payer
-            false, // is_nonce_account
-            &rollback_accounts,
-            &DurableNonce::default(),
-            1,
-            &pre_fee_payer_account,
-        ));
-    }
-
-    #[test]
-    fn test_nonced_failure_accounts_rollback_from_pays() {
-        let nonce_address = Pubkey::new_unique();
-        let nonce_authority = keypair_from_seed(&[0; 32]).unwrap();
-        let from = keypair_from_seed(&[1; 32]).unwrap();
-        let from_address = from.pubkey();
-        let to_address = Pubkey::new_unique();
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let nonce_state = NonceVersions::new(NonceState::Initialized(NonceData::new(
-            nonce_authority.pubkey(),
-            durable_nonce,
-            0,
-        )));
-        let nonce_account_post =
-            AccountSharedData::new_data(43, &nonce_state, &system_program::id()).unwrap();
-        let from_account_post = AccountSharedData::new(4199, 0, &Pubkey::default());
-        let to_account = AccountSharedData::new(2, 0, &Pubkey::default());
-        let nonce_authority_account = AccountSharedData::new(3, 0, &Pubkey::default());
-        let recent_blockhashes_sysvar_account = AccountSharedData::new(4, 0, &Pubkey::default());
-
-        let instructions = vec![
-            system_instruction::advance_nonce_account(&nonce_address, &nonce_authority.pubkey()),
-            system_instruction::transfer(&from_address, &to_address, 42),
-        ];
-        let message = Message::new(&instructions, Some(&from_address));
-        let blockhash = Hash::new_unique();
-        let transaction_accounts = vec![
-            (message.account_keys[0], from_account_post),
-            (message.account_keys[1], nonce_authority_account),
-            (message.account_keys[2], nonce_account_post),
-            (message.account_keys[3], to_account),
-            (message.account_keys[4], recent_blockhashes_sysvar_account),
-        ];
-        let tx = new_sanitized_tx(&[&nonce_authority, &from], message, blockhash);
-
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let nonce_state = NonceVersions::new(NonceState::Initialized(NonceData::new(
-            nonce_authority.pubkey(),
-            durable_nonce,
-            0,
-        )));
-        let nonce_account_pre =
-            AccountSharedData::new_data(42, &nonce_state, &system_program::id()).unwrap();
-        let from_account_pre = AccountSharedData::new(4242, 0, &Pubkey::default());
-
-        let nonce = NoncePartial::new(nonce_address, nonce_account_pre.clone());
-        let loaded = Ok(LoadedTransaction {
-            accounts: transaction_accounts,
-            program_indices: vec![],
-            fee_details: FeeDetails::default(),
-            rollback_accounts: RollbackAccounts::SeparateNonceAndFeePayer {
-                nonce: nonce.clone(),
-                fee_payer_account: from_account_pre.clone(),
-            },
-            compute_budget_limits: ComputeBudgetLimits::default(),
-            rent: 0,
-            rent_debits: RentDebits::default(),
-            loaded_accounts_data_size: 0,
-        });
-
-        let mut loaded = vec![loaded];
-
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let txs = vec![tx];
-        let execution_results = vec![new_execution_result(Err(
-            TransactionError::InstructionError(1, InstructionError::InvalidArgument),
-        ))];
-        let (collected_accounts, _) = Accounts::collect_accounts_to_store(
-            &txs,
-            &execution_results,
-            loaded.as_mut_slice(),
-            &durable_nonce,
-            0,
-        );
-        assert_eq!(collected_accounts.len(), 2);
-        assert_eq!(
-            collected_accounts
-                .iter()
-                .find(|(pubkey, _account)| *pubkey == &from_address)
-                .map(|(_pubkey, account)| *account)
-                .cloned()
-                .unwrap(),
-            from_account_pre,
-        );
-        let collected_nonce_account = collected_accounts
-            .iter()
-            .find(|(pubkey, _account)| *pubkey == &nonce_address)
-            .map(|(_pubkey, account)| *account)
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            collected_nonce_account.lamports(),
-            nonce_account_pre.lamports(),
-        );
-        assert_matches!(
-            nonce_account::verify_nonce_account(&collected_nonce_account, durable_nonce.as_hash()),
-            Some(_)
-        );
-    }
-
-    #[test]
-    fn test_nonced_failure_accounts_rollback_nonce_pays() {
-        let nonce_authority = keypair_from_seed(&[0; 32]).unwrap();
-        let nonce_address = nonce_authority.pubkey();
-        let from = keypair_from_seed(&[1; 32]).unwrap();
-        let from_address = from.pubkey();
-        let to_address = Pubkey::new_unique();
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let nonce_state = NonceVersions::new(NonceState::Initialized(NonceData::new(
-            nonce_authority.pubkey(),
-            durable_nonce,
-            0,
-        )));
-        let nonce_account_post =
-            AccountSharedData::new_data(43, &nonce_state, &system_program::id()).unwrap();
-        let from_account_post = AccountSharedData::new(4200, 0, &Pubkey::default());
-        let to_account = AccountSharedData::new(2, 0, &Pubkey::default());
-        let nonce_authority_account = AccountSharedData::new(3, 0, &Pubkey::default());
-        let recent_blockhashes_sysvar_account = AccountSharedData::new(4, 0, &Pubkey::default());
-
-        let instructions = vec![
-            system_instruction::advance_nonce_account(&nonce_address, &nonce_authority.pubkey()),
-            system_instruction::transfer(&from_address, &to_address, 42),
-        ];
-        let message = Message::new(&instructions, Some(&nonce_address));
-        let blockhash = Hash::new_unique();
-        let transaction_accounts = vec![
-            (message.account_keys[0], from_account_post),
-            (message.account_keys[1], nonce_authority_account),
-            (message.account_keys[2], nonce_account_post),
-            (message.account_keys[3], to_account),
-            (message.account_keys[4], recent_blockhashes_sysvar_account),
-        ];
-        let tx = new_sanitized_tx(&[&nonce_authority, &from], message, blockhash);
-
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let nonce_state = NonceVersions::new(NonceState::Initialized(NonceData::new(
-            nonce_authority.pubkey(),
-            durable_nonce,
-            0,
-        )));
-        let nonce_account_pre =
-            AccountSharedData::new_data(42, &nonce_state, &system_program::id()).unwrap();
-
-        let nonce = NoncePartial::new(nonce_address, nonce_account_pre.clone());
-        let loaded = Ok(LoadedTransaction {
-            accounts: transaction_accounts,
-            program_indices: vec![],
-            fee_details: FeeDetails::default(),
-            rollback_accounts: RollbackAccounts::SameNonceAndFeePayer {
-                nonce: nonce.clone(),
-            },
-            compute_budget_limits: ComputeBudgetLimits::default(),
-            rent: 0,
-            rent_debits: RentDebits::default(),
-            loaded_accounts_data_size: 0,
-        });
-
-        let mut loaded = vec![loaded];
-
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let txs = vec![tx];
-        let execution_results = vec![new_execution_result(Err(
-            TransactionError::InstructionError(1, InstructionError::InvalidArgument),
-        ))];
-        let (collected_accounts, _) = Accounts::collect_accounts_to_store(
-            &txs,
-            &execution_results,
-            loaded.as_mut_slice(),
-            &durable_nonce,
-            0,
-        );
-        assert_eq!(collected_accounts.len(), 1);
-        let collected_nonce_account = collected_accounts
-            .iter()
-            .find(|(pubkey, _account)| *pubkey == &nonce_address)
-            .map(|(_pubkey, account)| *account)
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            collected_nonce_account.lamports(),
-            nonce_account_pre.lamports()
-        );
-        assert_matches!(
-            nonce_account::verify_nonce_account(&collected_nonce_account, durable_nonce.as_hash()),
-            Some(_)
-        );
     }
 
     #[test]

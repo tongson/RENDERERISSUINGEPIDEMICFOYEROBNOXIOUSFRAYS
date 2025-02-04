@@ -1,4 +1,4 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 #![recursion_limit = "2048"]
 //! The `solana` library implements the Solana high-performance blockchain architecture.
@@ -10,9 +10,9 @@
 
 pub mod accounts_hash_verifier;
 pub mod admin_rpc_post_init;
+pub mod banking_simulation;
 pub mod banking_stage;
 pub mod banking_trace;
-pub mod bundle_account_locker;
 pub mod bundle_stage;
 pub mod cache_block_meta_service;
 pub mod cluster_info_vote_listener;
@@ -28,8 +28,8 @@ pub mod immutable_deserialized_bundle;
 pub mod next_leader;
 pub mod optimistic_confirmation_verifier;
 pub mod p3;
+pub mod p3_quic;
 pub mod packet_bundle;
-pub mod paladin_bundle_stage;
 pub mod poh_timing_report_service;
 pub mod poh_timing_reporter;
 pub mod proxy;
@@ -52,7 +52,6 @@ pub mod tracer_packet_stats;
 pub mod tvu;
 pub mod unfrozen_gossip_verified_vote_hashes;
 pub mod validator;
-pub mod verified_vote_packets;
 pub mod vote_simulator;
 pub mod voting_service;
 pub mod warm_quic_cache_service;
@@ -102,9 +101,6 @@ pub fn proto_packet_to_packet(p: jito_protos::proto::packet::Packet) -> Packet {
             if flags.forwarded {
                 packet.meta_mut().flags.insert(PacketFlags::FORWARDED);
             }
-            if flags.tracer_packet {
-                packet.meta_mut().flags.insert(PacketFlags::TRACER_PACKET);
-            }
             if flags.repair {
                 packet.meta_mut().flags.insert(PacketFlags::REPAIR);
             }
@@ -112,7 +108,7 @@ pub fn proto_packet_to_packet(p: jito_protos::proto::packet::Packet) -> Packet {
                 packet
                     .meta_mut()
                     .flags
-                    .insert(PacketFlags::FROM_STAKED_NODE)
+                    .insert(PacketFlags::FROM_STAKED_NODE);
             }
         }
     }

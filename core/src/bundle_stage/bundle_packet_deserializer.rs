@@ -1,16 +1,16 @@
 //! Deserializes PacketBundles
 use {
     crate::{
+        banking_stage::{
+            immutable_deserialized_packet::ImmutableDeserializedPacket,
+            packet_filter::PacketFilterFailure,
+        },
         immutable_deserialized_bundle::{DeserializedBundleError, ImmutableDeserializedBundle},
         packet_bundle::PacketBundle,
     },
     crossbeam_channel::{Receiver, RecvTimeoutError},
-    solana_runtime::bank_forks::BankForks,
     solana_sdk::saturating_add_assign,
-    std::{
-        sync::{Arc, RwLock},
-        time::{Duration, Instant},
-    },
+    std::time::{Duration, Instant},
 };
 
 /// Results from deserializing packet batches.
@@ -25,8 +25,6 @@ pub struct ReceiveBundleResults {
 pub struct BundlePacketDeserializer {
     /// Receiver for bundle packets
     bundle_packet_receiver: Receiver<Vec<PacketBundle>>,
-    /// Provides working bank for deserializer to check feature activation
-    bank_forks: Arc<RwLock<BankForks>>,
     /// Max packets per bundle
     max_packets_per_bundle: Option<usize>,
 }
@@ -34,12 +32,10 @@ pub struct BundlePacketDeserializer {
 impl BundlePacketDeserializer {
     pub fn new(
         bundle_packet_receiver: Receiver<Vec<PacketBundle>>,
-        bank_forks: Arc<RwLock<BankForks>>,
         max_packets_per_bundle: Option<usize>,
     ) -> Self {
         Self {
             bundle_packet_receiver,
-            bank_forks,
             max_packets_per_bundle,
         }
     }
@@ -49,20 +45,18 @@ impl BundlePacketDeserializer {
         &self,
         recv_timeout: Duration,
         capacity: usize,
+        packet_filter: &impl Fn(
+            ImmutableDeserializedPacket,
+        ) -> Result<ImmutableDeserializedPacket, PacketFilterFailure>,
     ) -> Result<ReceiveBundleResults, RecvTimeoutError> {
         let (bundle_count, _packet_count, mut bundles) =
             self.receive_until(recv_timeout, capacity)?;
 
-        // Note: this can be removed after feature `round_compute_unit_price` is activated in
-        // mainnet-beta
-        let _working_bank = self.bank_forks.read().unwrap().working_bank();
-        let round_compute_unit_price_enabled = false; // TODO get from working_bank.feature_set
-
         Ok(Self::deserialize_and_collect_bundles(
             bundle_count,
             &mut bundles,
-            round_compute_unit_price_enabled,
             self.max_packets_per_bundle,
+            packet_filter,
         ))
     }
 
@@ -71,18 +65,16 @@ impl BundlePacketDeserializer {
     fn deserialize_and_collect_bundles(
         bundle_count: usize,
         bundles: &mut [PacketBundle],
-        round_compute_unit_price_enabled: bool,
         max_packets_per_bundle: Option<usize>,
+        packet_filter: &impl Fn(
+            ImmutableDeserializedPacket,
+        ) -> Result<ImmutableDeserializedPacket, PacketFilterFailure>,
     ) -> ReceiveBundleResults {
         let mut deserialized_bundles = Vec::with_capacity(bundle_count);
         let mut num_dropped_bundles: usize = 0;
 
         for bundle in bundles.iter_mut() {
-            match Self::deserialize_bundle(
-                bundle,
-                round_compute_unit_price_enabled,
-                max_packets_per_bundle,
-            ) {
+            match Self::deserialize_bundle(bundle, max_packets_per_bundle, packet_filter) {
                 Ok(deserialized_bundle) => {
                     deserialized_bundles.push(deserialized_bundle);
                 }
@@ -140,15 +132,12 @@ impl BundlePacketDeserializer {
     /// bundle failed to deserialize
     pub fn deserialize_bundle(
         bundle: &mut PacketBundle,
-        round_compute_unit_price_enabled: bool,
         max_packets_per_bundle: Option<usize>,
+        packet_filter: &impl Fn(
+            ImmutableDeserializedPacket,
+        ) -> Result<ImmutableDeserializedPacket, PacketFilterFailure>,
     ) -> Result<ImmutableDeserializedBundle, DeserializedBundleError> {
-        bundle.batch.iter_mut().for_each(|p| {
-            p.meta_mut()
-                .set_round_compute_unit_price(round_compute_unit_price_enabled);
-        });
-
-        ImmutableDeserializedBundle::new(bundle, max_packets_per_bundle)
+        ImmutableDeserializedBundle::new(bundle, max_packets_per_bundle, packet_filter)
     }
 }
 
@@ -159,14 +148,16 @@ mod tests {
         crossbeam_channel::unbounded,
         solana_ledger::genesis_utils::create_genesis_config,
         solana_perf::packet::PacketBatch,
-        solana_runtime::{bank::Bank, genesis_utils::GenesisConfigInfo},
+        solana_runtime::genesis_utils::GenesisConfigInfo,
         solana_sdk::{packet::Packet, signature::Signer, system_transaction::transfer},
     };
 
     #[test]
     fn test_deserialize_and_collect_bundles_empty() {
         let results =
-            BundlePacketDeserializer::deserialize_and_collect_bundles(0, &mut [], false, Some(5));
+            BundlePacketDeserializer::deserialize_and_collect_bundles(0, &mut [], Some(5), &|p| {
+                Ok(p)
+            });
         assert_eq!(results.deserialized_bundles.len(), 0);
         assert_eq!(results.num_dropped_bundles, 0);
     }
@@ -180,11 +171,9 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(10_000);
-        let (_, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-
         let (sender, receiver) = unbounded();
 
-        let deserializer = BundlePacketDeserializer::new(receiver, bank_forks, Some(10));
+        let deserializer = BundlePacketDeserializer::new(receiver, Some(10));
 
         let packet_bundles: Vec<_> = (0..10)
             .map(|_| PacketBundle {
@@ -205,7 +194,7 @@ mod tests {
         sender.send(packet_bundles.clone()).unwrap();
 
         let bundles = deserializer
-            .receive_bundles(Duration::from_millis(100), 5)
+            .receive_bundles(Duration::from_millis(100), 5, &Ok)
             .unwrap();
         // this is confusing, but it's sent as one batch
         assert_eq!(bundles.deserialized_bundles.len(), 10);
@@ -213,7 +202,7 @@ mod tests {
 
         // make sure empty
         assert_matches!(
-            deserializer.receive_bundles(Duration::from_millis(100), 5),
+            deserializer.receive_bundles(Duration::from_millis(100), 5, &Ok),
             Err(RecvTimeoutError::Timeout)
         );
 
@@ -221,19 +210,19 @@ mod tests {
         sender.send(packet_bundles.clone()).unwrap();
         sender.send(packet_bundles).unwrap();
         let bundles = deserializer
-            .receive_bundles(Duration::from_millis(100), 5)
+            .receive_bundles(Duration::from_millis(100), 5, &Ok)
             .unwrap();
         assert_eq!(bundles.deserialized_bundles.len(), 10);
         assert_eq!(bundles.num_dropped_bundles, 0);
 
         let bundles = deserializer
-            .receive_bundles(Duration::from_millis(100), 5)
+            .receive_bundles(Duration::from_millis(100), 5, &Ok)
             .unwrap();
         assert_eq!(bundles.deserialized_bundles.len(), 10);
         assert_eq!(bundles.num_dropped_bundles, 0);
 
         assert_matches!(
-            deserializer.receive_bundles(Duration::from_millis(100), 5),
+            deserializer.receive_bundles(Duration::from_millis(100), 5, &Ok),
             Err(RecvTimeoutError::Timeout)
         );
     }
@@ -241,17 +230,9 @@ mod tests {
     #[test]
     fn test_receive_bundles_bad_bundles() {
         solana_logger::setup();
-
-        let GenesisConfigInfo {
-            genesis_config,
-            mint_keypair: _,
-            ..
-        } = create_genesis_config(10_000);
-        let (_, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-
         let (sender, receiver) = unbounded();
 
-        let deserializer = BundlePacketDeserializer::new(receiver, bank_forks, Some(10));
+        let deserializer = BundlePacketDeserializer::new(receiver, Some(10));
 
         let packet_bundles: Vec<_> = (0..10)
             .map(|_| PacketBundle {
@@ -262,7 +243,7 @@ mod tests {
         sender.send(packet_bundles).unwrap();
 
         let bundles = deserializer
-            .receive_bundles(Duration::from_millis(100), 5)
+            .receive_bundles(Duration::from_millis(100), 5, &Ok)
             .unwrap();
         // this is confusing, but it's sent as one batch
         assert_eq!(bundles.deserialized_bundles.len(), 0);

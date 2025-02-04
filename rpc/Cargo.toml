@@ -35,6 +35,7 @@ solana-bundle = { workspace = true }
 solana-client = { workspace = true }
 solana-entry = { workspace = true }
 solana-faucet = { workspace = true }
+solana-feature-set = { workspace = true }
 solana-gossip = { workspace = true }
 solana-inline-spl = { workspace = true }
 solana-ledger = { workspace = true }

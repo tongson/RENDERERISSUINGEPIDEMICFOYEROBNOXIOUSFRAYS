@@ -1,16 +1,15 @@
 use {
     crate::{
-        ic_msg,
         loaded_programs::{
             ProgramCacheEntry, ProgramCacheEntryType, ProgramCacheForTxBatch,
             ProgramRuntimeEnvironments,
         },
-        log_collector::LogCollector,
         stable_log,
         sysvar_cache::SysvarCache,
-        timings::{ExecuteDetailsTimings, ExecuteTimings},
     },
     solana_compute_budget::compute_budget::ComputeBudget,
+    solana_feature_set::{move_precompile_verification_to_svm, FeatureSet},
+    solana_log_collector::{ic_msg, LogCollector},
     solana_measure::measure::Measure,
     solana_rbpf::{
         ebpf::MM_HEAP_START,
@@ -24,10 +23,10 @@ use {
         bpf_loader_deprecated,
         clock::Slot,
         epoch_schedule::EpochSchedule,
-        feature_set::FeatureSet,
         hash::Hash,
         instruction::{AccountMeta, InstructionError},
         native_loader,
+        precompiles::Precompile,
         pubkey::Pubkey,
         saturating_add_assign,
         stable_layout::stable_instruction::StableInstruction,
@@ -36,6 +35,7 @@ use {
             IndexOfAccount, InstructionAccount, TransactionAccount, TransactionContext,
         },
     },
+    solana_timings::{ExecuteDetailsTimings, ExecuteTimings},
     solana_type_overrides::sync::{atomic::Ordering, Arc},
     solana_vote::vote_account::VoteAccountsHashMap,
     std::{
@@ -418,10 +418,10 @@ impl<'a> InvokeContext<'a> {
         let instruction_accounts = duplicate_indicies
             .into_iter()
             .map(|duplicate_index| {
-                Ok(deduplicated_instruction_accounts
+                deduplicated_instruction_accounts
                     .get(duplicate_index)
-                    .ok_or(InstructionError::NotEnoughAccountKeys)?
-                    .clone())
+                    .cloned()
+                    .ok_or(InstructionError::NotEnoughAccountKeys)
             })
             .collect::<Result<Vec<InstructionAccount>, InstructionError>>()?;
 
@@ -466,6 +466,34 @@ impl<'a> InvokeContext<'a> {
             .and(self.pop())
     }
 
+    /// Processes a precompile instruction
+    pub fn process_precompile<'ix_data>(
+        &mut self,
+        precompile: &Precompile,
+        instruction_data: &[u8],
+        instruction_accounts: &[InstructionAccount],
+        program_indices: &[IndexOfAccount],
+        message_instruction_datas_iter: impl Iterator<Item = &'ix_data [u8]>,
+    ) -> Result<(), InstructionError> {
+        self.transaction_context
+            .get_next_instruction_context()?
+            .configure(program_indices, instruction_accounts, instruction_data);
+        self.push()?;
+
+        let feature_set = self.get_feature_set();
+        let move_precompile_verification_to_svm =
+            feature_set.is_active(&move_precompile_verification_to_svm::id());
+        if move_precompile_verification_to_svm {
+            let instruction_datas: Vec<_> = message_instruction_datas_iter.collect();
+            precompile
+                .verify(instruction_data, &instruction_datas, feature_set)
+                .map_err(InstructionError::from)
+                .and(self.pop())
+        } else {
+            self.pop()
+        }
+    }
+
     /// Calls the instruction's program entrypoint method
     fn process_executable_chain(
         &mut self,
@@ -476,6 +504,7 @@ impl<'a> InvokeContext<'a> {
         let process_executable_chain_time = Measure::start("process_executable_chain_time");
 
         let builtin_id = {
+            debug_assert!(instruction_context.get_number_of_program_accounts() <= 1);
             let borrowed_root_account = instruction_context
                 .try_borrow_program_account(self.transaction_context, 0)
                 .map_err(|_| InstructionError::UnsupportedProgramId)?;
@@ -677,15 +706,16 @@ macro_rules! with_mock_invoke_context {
     ) => {
         use {
             solana_compute_budget::compute_budget::ComputeBudget,
+            solana_feature_set::FeatureSet,
+            solana_log_collector::LogCollector,
             solana_sdk::{
-                account::ReadableAccount, feature_set::FeatureSet, hash::Hash, sysvar::rent::Rent,
+                account::ReadableAccount, hash::Hash, sysvar::rent::Rent,
                 transaction_context::TransactionContext,
             },
             solana_type_overrides::sync::Arc,
             $crate::{
                 invoke_context::{EnvironmentConfig, InvokeContext},
                 loaded_programs::ProgramCacheForTxBatch,
-                log_collector::LogCollector,
                 sysvar_cache::SysvarCache,
             },
         };
@@ -768,9 +798,11 @@ pub fn mock_process_instruction<F: FnMut(&mut InvokeContext), G: FnMut(&mut Invo
             is_writable: account_meta.is_writable,
         });
     }
-    program_indices.insert(0, transaction_accounts.len() as IndexOfAccount);
-    let processor_account = AccountSharedData::new(0, 0, &native_loader::id());
-    transaction_accounts.push((*loader_id, processor_account));
+    if program_indices.is_empty() {
+        program_indices.insert(0, transaction_accounts.len() as IndexOfAccount);
+        let processor_account = AccountSharedData::new(0, 0, &native_loader::id());
+        transaction_accounts.push((*loader_id, processor_account));
+    }
     let pop_epoch_schedule_account = if !transaction_accounts
         .iter()
         .any(|(key, _)| *key == sysvar::epoch_schedule::id())
@@ -813,7 +845,7 @@ mod tests {
     use {
         super::*,
         serde::{Deserialize, Serialize},
-        solana_compute_budget::compute_budget_processor,
+        solana_compute_budget::compute_budget_limits,
         solana_sdk::{account::WritableAccount, instruction::Instruction, rent::Rent},
     };
 
@@ -1141,7 +1173,7 @@ mod tests {
 
         with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
         invoke_context.compute_budget = ComputeBudget::new(
-            compute_budget_processor::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT as u64,
+            compute_budget_limits::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT as u64,
         );
 
         invoke_context
@@ -1153,7 +1185,7 @@ mod tests {
         assert_eq!(
             *invoke_context.get_compute_budget(),
             ComputeBudget::new(
-                compute_budget_processor::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT as u64
+                compute_budget_limits::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT as u64
             )
         );
         invoke_context.pop().unwrap();

@@ -47,6 +47,7 @@ use {
     solana_send_transaction_service::send_transaction_service::{
         self, MAX_BATCH_SEND_RATE_MS, MAX_TRANSACTION_BATCH_SIZE,
     },
+    solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
     solana_tpu_client::tpu_client::DEFAULT_TPU_CONNECTION_POOL_SIZE,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{path::PathBuf, str::FromStr},
@@ -85,6 +86,12 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
             Arg::with_name(SKIP_SEED_PHRASE_VALIDATION_ARG.name)
                 .long(SKIP_SEED_PHRASE_VALIDATION_ARG.long)
                 .help(SKIP_SEED_PHRASE_VALIDATION_ARG.help),
+        )
+        .arg(
+        	Arg::with_name("funnel")
+         		.long("funnel")
+           		.help("funnel. Defaults to None")
+             	.takes_value(true)
         )
         .arg(
         	Arg::with_name("p3_socket")
@@ -383,6 +390,14 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                     "Report this validator as healthy if its latest replayed optimistically \
                      confirmed slot is within the specified number of slots from the cluster's \
                      latest optimistically confirmed slot",
+                ),
+        )
+        .arg(
+            Arg::with_name("skip_preflight_health_check")
+                .long("skip-preflight-health-check")
+                .takes_value(false)
+                .help(
+                    "Skip health check when running a preflight check",
                 ),
         )
         .arg(
@@ -757,14 +772,12 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .long("rocksdb-shred-compaction")
                 .value_name("ROCKSDB_COMPACTION_STYLE")
                 .takes_value(true)
-                .possible_values(&["level", "fifo"])
+                .possible_values(&["level"])
                 .default_value(&default_args.rocksdb_shred_compaction)
                 .help(
                     "Controls how RocksDB compacts shreds. *WARNING*: You will lose your \
                      Blockstore data when you switch between options. Possible values are: \
-                     'level': stores shreds using RocksDB's default (level) compaction. \
-                     'fifo': stores shreds under RocksDB's FIFO compaction. This option is more \
-                     efficient on disk-write-bytes of the Blockstore.",
+                     'level': stores shreds using RocksDB's default (level) compaction.",
                 ),
         )
         .arg(
@@ -1006,6 +1019,17 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .help("Controls the rate of the clients connections per IpAddr per minute."),
         )
         .arg(
+            Arg::with_name("num_quic_endpoints")
+                .long("num-quic-endpoints")
+                .takes_value(true)
+                .default_value(&default_args.num_quic_endpoints)
+                .validator(is_parsable::<usize>)
+                .hidden(hidden_unless_forced())
+                .help("The number of QUIC endpoints used for TPU and TPU-Forward. It can be increased to \
+                       increase network ingest throughput, at the expense of higher CPU and general \
+                       validator load."),
+        )
+        .arg(
             Arg::with_name("staked_nodes_overrides")
                 .long("staked-nodes-overrides")
                 .value_name("PATH")
@@ -1046,6 +1070,27 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .takes_value(true)
                 .default_value(&default_args.rpc_threads)
                 .help("Number of threads to use for servicing RPC requests"),
+        )
+        .arg(
+            Arg::with_name("rpc_blocking_threads")
+                .long("rpc-blocking-threads")
+                .value_name("NUMBER")
+                .validator(is_parsable::<usize>)
+                .validator(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("error parsing '{value}': {err}"))
+                        .and_then(|threads| {
+                            if threads > 0 {
+                                Ok(())
+                            } else {
+                                Err("value must be >= 1".to_string())
+                            }
+                        })
+                })
+                .takes_value(true)
+                .default_value(&default_args.rpc_blocking_threads)
+                .help("Number of blocking threads to use for servicing CPU bound RPC requests (eg getMultipleAccounts)"),
         )
         .arg(
             Arg::with_name("rpc_niceness_adj")
@@ -1282,14 +1327,20 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .multiple(true)
                 .help("Specify the configuration file for the Geyser plugin."),
         )
-.arg(
-            Arg::with_name("runtime_plugin_config")
-                .long("runtime-plugin-config")
-                .value_name("FILE")
+        .arg(
+            Arg::with_name("geyser_plugin_always_enabled")
+                .long("geyser-plugin-always-enabled")
+                .value_name("BOOLEAN")
                 .takes_value(true)
-                .multiple(true)
-                .help("Specify the configuration file for a Runtime plugin.")
+                .default_value("false")
+                .help("Еnable Geyser interface even if no Geyser configs are specified."),
         )
+        .arg(Arg::with_name("runtime_plugin_config")
+            .long("runtime-plugin-config")
+            .value_name("FILE")
+            .takes_value(true)
+            .multiple(true)
+            .help("Specify the configuration file for a Runtime plugin."))
         .arg(
             Arg::with_name("snapshot_archive_format")
                 .long("snapshot-archive-format")
@@ -1394,6 +1445,22 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .hidden(hidden_unless_forced()),
         )
         .arg(
+            Arg::with_name("accounts_db_scan_filter_for_shrinking")
+                .long("accounts-db-scan-filter-for-shrinking")
+                .takes_value(true)
+                .possible_values(&["all", "only-abnormal", "only-abnormal-with-verify"])
+                .help(
+                    "Debug option to use different type of filtering for accounts index scan in \
+                    shrinking. \"all\" will scan both in-memory and on-disk accounts index, which is the default. \
+                    \"only-abnormal\" will scan in-memory accounts index only for abnormal entries and \
+                    skip scanning on-disk accounts index by assuming that on-disk accounts index contains \
+                    only normal accounts index entry. \"only-abnormal-with-verify\" is similar to \
+                    \"only-abnormal\", which will scan in-memory index for abnormal entries, but will also \
+                    verify that on-disk account entries are indeed normal.",
+                )
+                .hidden(hidden_unless_forced()),
+        )
+        .arg(
             Arg::with_name("accounts_db_test_skip_rewrites")
                 .long("accounts-db-test-skip-rewrites")
                 .help(
@@ -1470,6 +1537,12 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .hidden(hidden_unless_forced()),
         )
         .arg(
+            Arg::with_name("accounts_db_experimental_accumulator_hash")
+                .long("accounts-db-experimental-accumulator-hash")
+                .help("Enables the experimental accumulator hash")
+                .hidden(hidden_unless_forced()),
+        )
+        .arg(
             Arg::with_name("accounts_index_scan_results_limit_mb")
                 .long("accounts-index-scan-results-limit-mb")
                 .value_name("MEGABYTES")
@@ -1478,17 +1551,6 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .help(
                     "How large accumulated results from an accounts index scan can become. If \
                      this is exceeded, the scan aborts.",
-                ),
-        )
-        .arg(
-            Arg::with_name("accounts_index_memory_limit_mb")
-                .long("accounts-index-memory-limit-mb")
-                .value_name("MEGABYTES")
-                .validator(is_parsable::<usize>)
-                .takes_value(true)
-                .help(
-                    "How much memory the accounts index can consume. If this is exceeded, some \
-                     account index entries will be stored on disk.",
                 ),
         )
         .arg(
@@ -1653,12 +1715,17 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
             Arg::with_name("wen_restart")
                 .long("wen-restart")
                 .hidden(hidden_unless_forced())
-                .value_name("DIR")
+                .value_name("FILE")
                 .takes_value(true)
                 .required(false)
                 .conflicts_with("wait_for_supermajority")
+                .requires("wen_restart_coordinator")
                 .help(
-                    "When specified, the validator will enter Wen Restart mode which \
+                    "Only used during coordinated cluster restarts.\
+                    \n\n\
+                    Need to also specify the leader's pubkey in --wen-restart-leader.\
+                    \n\n\
+                    When specified, the validator will enter Wen Restart mode which \
                     pauses normal activity. Validators in this mode will gossip their last \
                     vote to reach consensus on a safe restart slot and repair all blocks \
                     on the selected fork. The safe slot will be a descendant of the latest \
@@ -1666,16 +1733,28 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                     optimistically confirmed slots. \
                     \n\n\
                     The progress in this mode will be saved in the file location provided. \
-                    If consensus is reached, the validator will automatically exit and then \
-                    execute wait_for_supermajority logic so the cluster will resume execution. \
-                    The progress file will be kept around for future debugging. \
-                    \n\n\
-                    After the cluster resumes normal operation, the validator arguments can \
-                    be adjusted to remove --wen_restart and update expected_shred_version to \
-                    the new shred_version agreed on in the consensus. \
+                    If consensus is reached, the validator will automatically exit with 200 \
+                    status code. Then the operators are expected to restart the validator \
+                    with --wait_for_supermajority and other arguments (including new shred_version, \
+                    supermajority slot, and bankhash) given in the error log before the exit so \
+                    the cluster will resume execution. The progress file will be kept around \
+                    for future debugging. \
                     \n\n\
                     If wen_restart fails, refer to the progress file (in proto3 format) for \
-                    further debugging.",
+                    further debugging and watch the discord channel for instructions.",
+                ),
+        )
+        .arg(
+            Arg::with_name("wen_restart_coordinator")
+                .long("wen-restart-coordinator")
+                .hidden(hidden_unless_forced())
+                .value_name("PUBKEY")
+                .takes_value(true)
+                .required(false)
+                .requires("wen_restart")
+                .help(
+                    "Specifies the pubkey of the leader used in wen restart. \
+                    May get stuck if the leader used is different from others.",
                 ),
         )
         .args(&thread_args(&default_args.thread_args))
@@ -2204,6 +2283,18 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
                 Ok(())
             }
         }));
+    // deprecated in v2.1 by PR #2721
+    add_arg!(Arg::with_name("accounts_index_memory_limit_mb")
+        .long("accounts-index-memory-limit-mb")
+        .value_name("MEGABYTES")
+        .validator(is_parsable::<usize>)
+        .takes_value(true)
+        .help(
+            "How much memory the accounts index can consume. If this is exceeded, some \
+         account index entries will be stored on disk.",
+        ),
+        usage_warning: "index memory limit has been deprecated. The limit arg has no effect now.",
+    );
     add_arg!(Arg::with_name("accountsdb_repl_bind_address")
         .long("accountsdb-repl-bind-address")
         .value_name("HOST")
@@ -2390,6 +2481,7 @@ pub struct DefaultArgs {
     pub rpc_send_transaction_batch_size: String,
     pub rpc_send_transaction_retry_pool_max_size: String,
     pub rpc_threads: String,
+    pub rpc_blocking_threads: String,
     pub rpc_niceness_adjustment: String,
     pub rpc_bigtable_timeout: String,
     pub rpc_bigtable_instance_name: String,
@@ -2421,6 +2513,7 @@ pub struct DefaultArgs {
     pub accounts_shrink_ratio: String,
     pub tpu_connection_pool_size: String,
     pub tpu_max_connections_per_ipaddr_per_minute: String,
+    pub num_quic_endpoints: String,
 
     // Exit subcommand
     pub exit_min_idle_time: String,
@@ -2480,6 +2573,7 @@ impl DefaultArgs {
                 .retry_pool_max_size
                 .to_string(),
             rpc_threads: num_cpus::get().to_string(),
+            rpc_blocking_threads: 1.max(num_cpus::get() / 4).to_string(),
             rpc_niceness_adjustment: "0".to_string(),
             rpc_bigtable_timeout: "30".to_string(),
             rpc_bigtable_instance_name: solana_storage_bigtable::DEFAULT_INSTANCE_NAME.to_string(),
@@ -2512,6 +2606,7 @@ impl DefaultArgs {
             tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE.to_string(),
             tpu_max_connections_per_ipaddr_per_minute:
                 DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE.to_string(),
+            num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
             rpc_max_request_body_size: MAX_REQUEST_BODY_SIZE.to_string(),
             exit_min_idle_time: "10".to_string(),
             exit_max_delinquent_stake: "5".to_string(),
@@ -3011,6 +3106,17 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .validator(is_parsable::<u64>)
                 .takes_value(true)
                 .help("Override the runtime's account lock limit per transaction"),
+        )
+        .arg(
+            Arg::with_name("clone_feature_set")
+                .long("clone-feature-set")
+                .takes_value(false)
+                .requires("json_rpc_url")
+                .help(
+                    "Copy a feature set from the cluster referenced by the --url \
+                     argument in the genesis configuration. If the ledger \
+                     already exists then this parameter is silently ignored",
+                ),
         );
 }
 

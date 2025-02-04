@@ -1,13 +1,5 @@
 //! defines block cost related limits
 //!
-use {
-    lazy_static::lazy_static,
-    solana_sdk::{
-        address_lookup_table, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
-        compute_budget, ed25519_program, loader_v4, pubkey::Pubkey, secp256k1_program,
-    },
-    std::collections::HashMap,
-};
 
 /// Static configurations:
 ///
@@ -34,28 +26,6 @@ pub const ED25519_VERIFY_STRICT_COST: u64 = COMPUTE_UNIT_TO_US_RATIO * 80;
 pub const WRITE_LOCK_UNITS: u64 = COMPUTE_UNIT_TO_US_RATIO * 10;
 /// Number of data bytes per compute units
 pub const INSTRUCTION_DATA_BYTES_COST: u64 = 140 /*bytes per us*/ / COMPUTE_UNIT_TO_US_RATIO;
-// Number of compute units for each built-in programs
-lazy_static! {
-    /// Number of compute units for each built-in programs
-    pub static ref BUILT_IN_INSTRUCTION_COSTS: HashMap<Pubkey, u64> = [
-        (solana_stake_program::id(), solana_stake_program::stake_instruction::DEFAULT_COMPUTE_UNITS),
-        (solana_config_program::id(), solana_config_program::config_processor::DEFAULT_COMPUTE_UNITS),
-        (solana_vote_program::id(), solana_vote_program::vote_processor::DEFAULT_COMPUTE_UNITS),
-        (solana_system_program::id(), solana_system_program::system_processor::DEFAULT_COMPUTE_UNITS),
-        (compute_budget::id(), solana_compute_budget_program::DEFAULT_COMPUTE_UNITS),
-        (address_lookup_table::program::id(), solana_address_lookup_table_program::processor::DEFAULT_COMPUTE_UNITS),
-        (bpf_loader_upgradeable::id(), solana_bpf_loader_program::UPGRADEABLE_LOADER_COMPUTE_UNITS),
-        (bpf_loader_deprecated::id(), solana_bpf_loader_program::DEPRECATED_LOADER_COMPUTE_UNITS),
-        (bpf_loader::id(), solana_bpf_loader_program::DEFAULT_LOADER_COMPUTE_UNITS),
-        (loader_v4::id(), solana_loader_v4_program::DEFAULT_COMPUTE_UNITS),
-        // Note: These are precompile, run directly in bank during sanitizing;
-        (secp256k1_program::id(), 0),
-        (ed25519_program::id(), 0),
-    ]
-    .iter()
-    .cloned()
-    .collect();
-}
 
 /// Statically computed data:
 ///
@@ -68,6 +38,7 @@ pub const MAX_BLOCK_UNITS: u64 =
 
 #[cfg(test)]
 static_assertions::const_assert_eq!(MAX_BLOCK_UNITS, 48_000_000);
+pub const MAX_BLOCK_UNITS_SIMD_0207: u64 = 50_000_000;
 
 /// Number of compute units that a writable account in a block is allowed. The
 /// limit is to prevent too many transactions write to same account, therefore
@@ -87,3 +58,16 @@ static_assertions::const_assert_eq!(MAX_VOTE_UNITS, 36_000_000);
 /// The maximum allowed size, in bytes, that accounts data can grow, per block.
 /// This can also be thought of as the maximum size of new allocations per block.
 pub const MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA: u64 = 100_000_000;
+
+/// Return the block limits that will be used upon activation of SIMD-0207.
+/// Returns as
+/// (account_limit, block_limit, vote_limit)
+// ^ Above order is used to be consistent with the order of
+//   `CostTracker::set_limits`.
+pub const fn simd_0207_block_limits() -> (u64, u64, u64) {
+    (
+        MAX_WRITABLE_ACCOUNT_UNITS,
+        MAX_BLOCK_UNITS_SIMD_0207,
+        MAX_VOTE_UNITS,
+    )
+}

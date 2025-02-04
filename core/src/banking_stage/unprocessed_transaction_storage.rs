@@ -21,13 +21,15 @@ use {
     },
     itertools::Itertools,
     min_max_heap::MinMaxHeap,
-    solana_bundle::{bundle_execution::LoadAndExecuteBundleError, BundleExecutionError},
-    solana_measure::{measure, measure_us},
+    solana_accounts_db::account_locks::validate_account_locks,
+    solana_bundle::{
+        bundle_execution::LoadAndExecuteBundleError, BundleExecutionError, SanitizedBundle,
+    },
+    solana_feature_set::FeatureSet,
+    solana_measure::measure_us,
     solana_runtime::bank::Bank,
     solana_sdk::{
-        bundle::SanitizedBundle,
         clock::{Slot, FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET},
-        feature_set::FeatureSet,
         hash::Hash,
         pubkey::Pubkey,
         saturating_add_assign,
@@ -47,6 +49,7 @@ use {
 pub const UNPROCESSED_BUFFER_STEP_SIZE: usize = 64;
 /// Maximum number of votes a single receive call will accept
 const MAX_NUM_VOTES_RECEIVE: usize = 10_000;
+const MAX_BUFFERED_BUNDLES: usize = 5;
 
 #[derive(Debug)]
 pub enum UnprocessedTransactionStorage {
@@ -187,8 +190,8 @@ fn consume_scan_should_process_packet(
         let message = sanitized_transaction.message();
 
         // Check the number of locks and whether there are duplicates
-        if SanitizedTransaction::validate_account_locks(
-            message,
+        if validate_account_locks(
+            message.account_keys(),
             bank.get_transaction_account_lock_limit(),
         )
         .is_err()
@@ -529,8 +532,8 @@ impl UnprocessedTransactionStorage {
     pub(crate) fn cache_epoch_boundary_info(&mut self, bank: &Bank) {
         match self {
             Self::LocalTransactionStorage(_) => (),
-            UnprocessedTransactionStorage::BundleStorage(_) => (),
             Self::VoteStorage(vote_storage) => vote_storage.cache_epoch_boundary_info(bank),
+            UnprocessedTransactionStorage::BundleStorage(_) => (),
         }
     }
 }
@@ -788,35 +791,24 @@ impl ThreadLocalUnprocessedPackets {
                         if accepting_packets {
                             let (
                                 (sanitized_transactions, transaction_to_packet_indexes),
-                                packet_conversion_time,
-                            ): (
-                                (Vec<SanitizedTransaction>, Vec<usize>),
-                                _,
-                            ) = measure!(
-                                self.sanitize_unforwarded_packets(
-                                    &packets_to_forward,
-                                    &bank,
-                                    &mut total_dropped_packets
-                                ),
-                                "sanitize_packet",
-                            );
+                                packet_conversion_us,
+                            ) = measure_us!(self.sanitize_unforwarded_packets(
+                                &packets_to_forward,
+                                &bank,
+                                &mut total_dropped_packets
+                            ));
                             saturating_add_assign!(
                                 total_packet_conversion_us,
-                                packet_conversion_time.as_us()
+                                packet_conversion_us
                             );
 
-                            let (forwardable_transaction_indexes, filter_packets_time) = measure!(
-                                Self::filter_invalid_transactions(
+                            let (forwardable_transaction_indexes, filter_packets_us) =
+                                measure_us!(Self::filter_invalid_transactions(
                                     &sanitized_transactions,
                                     &bank,
                                     &mut total_dropped_packets
-                                ),
-                                "filter_packets",
-                            );
-                            saturating_add_assign!(
-                                total_filter_packets_us,
-                                filter_packets_time.as_us()
-                            );
+                                ));
+                            saturating_add_assign!(total_filter_packets_us, filter_packets_us);
 
                             for forwardable_transaction_index in &forwardable_transaction_indexes {
                                 saturating_add_assign!(total_forwardable_packets, 1);
@@ -1198,7 +1190,7 @@ impl BundleStorage {
     }
 
     pub(crate) fn max_receive_size(&self) -> usize {
-        self.unprocessed_bundle_storage.capacity() - self.unprocessed_bundle_storage.len()
+        MAX_BUFFERED_BUNDLES - self.unprocessed_bundle_storage.len()
     }
 
     fn forward_option(&self) -> ForwardOption {
@@ -1366,10 +1358,6 @@ impl BundleStorage {
                         );
                         self.push_back_cost_model_buffered_bundles(vec![deserialized_bundle]);
                     }
-                    // If we fail to take a lock, retry the bundle on next iteration.
-                    Err(BundleExecutionError::TransactionFailure(
-                        LoadAndExecuteBundleError::AccountInUse,
-                    )) => rebuffered_bundles.push(deserialized_bundle),
                     Err(BundleExecutionError::TransactionFailure(e)) => {
                         debug!(
                             "bundle={} execution error: {:?}",
@@ -1399,10 +1387,7 @@ impl BundleStorage {
         is_slot_over
     }
 
-    /// Drains the unprocessed_bundle_storage, converting bundle packets into SanitizedBundles.
-    ///
-    /// Given constraints around the address lookup table, do not buffer these bundles across
-    /// slot boundaries.
+    /// Drains the unprocessed_bundle_storage, converting bundle packets into SanitizedBundles
     fn drain_and_sanitize_bundles(
         &mut self,
         bank: Arc<Bank>,
@@ -1491,6 +1476,7 @@ impl BundleStorage {
 mod tests {
     use {
         super::*,
+        itertools::iproduct,
         solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
         solana_perf::packet::{Packet, PacketFlags},
         solana_runtime::genesis_utils,
@@ -1747,14 +1733,16 @@ mod tests {
             assert!(deserialized_packets.contains(&big_transfer));
         }
 
-        for (vote_source, staked) in [VoteSource::Gossip, VoteSource::Tpu]
-            .into_iter()
-            .flat_map(|vs| [(vs, true), (vs, false)])
-        {
-            let latest_unprocessed_votes = LatestUnprocessedVotes::default();
-            if staked {
-                latest_unprocessed_votes.set_staked_nodes(&[keypair.pubkey()]);
-            }
+        for (vote_source, staked) in iproduct!(
+            [VoteSource::Gossip, VoteSource::Tpu].into_iter(),
+            [true, false].into_iter()
+        ) {
+            let staked_keys = if staked {
+                vec![vote_keypair.pubkey()]
+            } else {
+                vec![]
+            };
+            let latest_unprocessed_votes = LatestUnprocessedVotes::new_for_tests(&staked_keys);
             let mut transaction_storage = UnprocessedTransactionStorage::new_vote_storage(
                 Arc::new(latest_unprocessed_votes),
                 vote_source,
@@ -1790,8 +1778,8 @@ mod tests {
         )?;
         vote.meta_mut().flags.set(PacketFlags::SIMPLE_VOTE_TX, true);
 
-        let latest_unprocessed_votes = LatestUnprocessedVotes::default();
-        latest_unprocessed_votes.set_staked_nodes(&[node_keypair.pubkey()]);
+        let latest_unprocessed_votes =
+            LatestUnprocessedVotes::new_for_tests(&[vote_keypair.pubkey()]);
         let mut transaction_storage = UnprocessedTransactionStorage::new_vote_storage(
             Arc::new(latest_unprocessed_votes),
             VoteSource::Tpu,

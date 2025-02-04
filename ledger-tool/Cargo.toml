@@ -32,18 +32,20 @@ solana-bpf-loader-program = { workspace = true }
 solana-clap-utils = { workspace = true }
 solana-cli-output = { workspace = true }
 solana-compute-budget = { workspace = true }
-solana-core = { workspace = true }
+solana-core = { workspace = true, features = ["dev-context-only-utils"] }
 solana-cost-model = { workspace = true }
 solana-entry = { workspace = true }
+solana-feature-set = { workspace = true }
 solana-geyser-plugin-manager = { workspace = true }
 solana-gossip = { workspace = true }
 solana-ledger = { workspace = true, features = ["dev-context-only-utils"] }
+solana-log-collector = { workspace = true }
 solana-logger = { workspace = true }
 solana-measure = { workspace = true }
 solana-program-runtime = { workspace = true }
 solana-rpc = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
-solana-sdk = { workspace = true }
+solana-sdk = { workspace = true, features = ["openssl-vendored"] }
 solana-stake-program = { workspace = true }
 solana-storage-bigtable = { workspace = true }
 solana-streamer = { workspace = true }

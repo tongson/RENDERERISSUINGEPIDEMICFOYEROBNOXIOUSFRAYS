@@ -1,7 +1,10 @@
 use {
     super::BundleStageLoopMetrics,
     crate::{
-        banking_stage::unprocessed_transaction_storage::UnprocessedTransactionStorage,
+        banking_stage::{
+            immutable_deserialized_packet::ImmutableDeserializedPacket,
+            unprocessed_transaction_storage::UnprocessedTransactionStorage,
+        },
         bundle_stage::{
             bundle_packet_deserializer::{BundlePacketDeserializer, ReceiveBundleResults},
             bundle_stage_leader_metrics::BundleStageLeaderMetrics,
@@ -11,12 +14,8 @@ use {
     },
     crossbeam_channel::{Receiver, RecvTimeoutError},
     solana_measure::{measure::Measure, measure_us},
-    solana_runtime::bank_forks::BankForks,
     solana_sdk::timing::timestamp,
-    std::{
-        sync::{Arc, RwLock},
-        time::Duration,
-    },
+    std::time::Duration,
 };
 
 pub struct BundleReceiver {
@@ -28,14 +27,12 @@ impl BundleReceiver {
     pub fn new(
         id: u32,
         bundle_packet_receiver: Receiver<Vec<PacketBundle>>,
-        bank_forks: Arc<RwLock<BankForks>>,
         max_packets_per_bundle: Option<usize>,
     ) -> Self {
         Self {
             id,
             bundle_packet_deserializer: BundlePacketDeserializer::new(
                 bundle_packet_receiver,
-                bank_forks,
                 max_packets_per_bundle,
             ),
         }
@@ -52,7 +49,16 @@ impl BundleReceiver {
             let recv_timeout = Self::get_receive_timeout(unprocessed_bundle_storage);
             let mut recv_and_buffer_measure = Measure::start("recv_and_buffer");
             self.bundle_packet_deserializer
-                .receive_bundles(recv_timeout, unprocessed_bundle_storage.max_receive_size())
+                .receive_bundles(
+                    recv_timeout,
+                    unprocessed_bundle_storage.max_receive_size(),
+                    &|packet: ImmutableDeserializedPacket| {
+                        // see packet_receiver.rs
+                        packet.check_insufficent_compute_unit_limit()?;
+                        packet.check_excessive_precompiles()?;
+                        Ok(packet)
+                    },
+                )
                 // Consumes results if Ok, otherwise we keep the Err
                 .map(|receive_bundle_results| {
                     self.buffer_bundles(
@@ -170,21 +176,22 @@ mod tests {
         crossbeam_channel::unbounded,
         rand::{thread_rng, RngCore},
         solana_bundle::{
-            bundle_execution::LoadAndExecuteBundleError, BundleExecutionError, TipError,
+            bundle_execution::LoadAndExecuteBundleError, BundleExecutionError, SanitizedBundle,
+            TipError,
         },
         solana_ledger::genesis_utils::create_genesis_config,
         solana_perf::packet::PacketBatch,
         solana_poh::poh_recorder::PohRecorderError,
         solana_runtime::{bank::Bank, genesis_utils::GenesisConfigInfo},
         solana_sdk::{
-            bundle::{derive_bundle_id, SanitizedBundle},
+            bundle::derive_bundle_id,
             hash::Hash,
             packet::Packet,
             signature::{Keypair, Signer},
             system_transaction::transfer,
             transaction::VersionedTransaction,
         },
-        std::collections::HashSet,
+        std::{collections::HashSet, sync::Arc},
     };
 
     /// Makes `num_bundles` random bundles with `num_packets_per_bundle` packets per bundle.
@@ -254,7 +261,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         let bundles = make_random_bundles(&mint_keypair, 10, 2, genesis_config.hash());
         sender.send(bundles.clone()).unwrap();
@@ -305,7 +312,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 more than capacity
         let bundles = make_random_bundles(
@@ -364,7 +371,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 bundles across the queue
         let bundles = make_random_bundles(&mint_keypair, 5, 2, genesis_config.hash());
@@ -431,7 +438,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 bundles across the queue
         let bundles = make_random_bundles(&mint_keypair, 5, 2, genesis_config.hash());
@@ -496,7 +503,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 bundles across the queue
         let bundles = make_random_bundles(&mint_keypair, 5, 2, genesis_config.hash());
@@ -544,7 +551,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 bundles across the queue
         let bundles = make_random_bundles(&mint_keypair, 5, 2, genesis_config.hash());
@@ -590,7 +597,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 bundles across the queue
         let bundles = make_random_bundles(&mint_keypair, 5, 2, genesis_config.hash());
@@ -632,7 +639,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 5 bundles across the queue
         let bundles = make_random_bundles(&mint_keypair, 5, 2, genesis_config.hash());
@@ -709,7 +716,7 @@ mod tests {
         let mut unprocessed_storage = UnprocessedTransactionStorage::new_bundle_storage();
 
         let (sender, receiver) = unbounded();
-        let mut bundle_receiver = BundleReceiver::new(0, receiver, bank_forks.clone(), Some(5));
+        let mut bundle_receiver = BundleReceiver::new(0, receiver, Some(5));
 
         // send 500 bundles across the queue
         let bundles0 = make_random_bundles(

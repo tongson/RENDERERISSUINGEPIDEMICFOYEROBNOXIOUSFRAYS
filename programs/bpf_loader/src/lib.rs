@@ -6,15 +6,17 @@ pub mod syscalls;
 
 use {
     solana_compute_budget::compute_budget::MAX_INSTRUCTION_STACK_DEPTH,
+    solana_feature_set::{
+        bpf_account_data_direct_mapping, enable_bpf_loader_set_authority_checked_ix,
+    },
+    solana_log_collector::{ic_logger_msg, ic_msg, LogCollector},
     solana_measure::measure::Measure,
     solana_program_runtime::{
-        ic_logger_msg, ic_msg,
         invoke_context::{BpfAllocator, InvokeContext, SerializedAccountMetadata, SyscallContext},
         loaded_programs::{
             LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
             DELAY_VISIBILITY_SLOT_OFFSET,
         },
-        log_collector::LogCollector,
         mem_pool::VmMemoryPool,
         stable_log,
         sysvar_cache::get_sysvar_with_account_check,
@@ -35,9 +37,6 @@ use {
         bpf_loader_upgradeable::{self, UpgradeableLoaderState},
         clock::Slot,
         entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
-        feature_set::{
-            bpf_account_data_direct_mapping, enable_bpf_loader_set_authority_checked_ix,
-        },
         instruction::{AccountMeta, InstructionError},
         loader_upgradeable_instruction::UpgradeableLoaderInstruction,
         loader_v4, native_loader,
@@ -1333,7 +1332,7 @@ fn common_close_account(
     Ok(())
 }
 
-fn execute<'a, 'b: 'a>(
+pub fn execute<'a, 'b: 'a>(
     executable: &'a Executable<InvokeContext<'static>>,
     invoke_context: &'a mut InvokeContext<'b>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1433,6 +1432,24 @@ fn execute<'a, 'b: 'a>(
                 Err(Box::new(error) as Box<dyn std::error::Error>)
             }
             ProgramResult::Err(mut error) => {
+                if invoke_context
+                    .get_feature_set()
+                    .is_active(&solana_feature_set::deplete_cu_meter_on_vm_failure::id())
+                    && !matches!(error, EbpfError::SyscallError(_))
+                {
+                    // when an exception is thrown during the execution of a
+                    // Basic Block (e.g., a null memory dereference or other
+                    // faults), determining the exact number of CUs consumed
+                    // up to the point of failure requires additional effort
+                    // and is unnecessary since these cases are rare.
+                    //
+                    // In order to simplify CU tracking, simply consume all
+                    // remaining compute units so that the block cost
+                    // tracker uses the full requested compute unit cost for
+                    // this failed transaction.
+                    invoke_context.consume(invoke_context.get_remaining());
+                }
+
                 if direct_mapping {
                     if let EbpfError::AccessViolation(
                         AccessType::Store,
@@ -1514,8 +1531,9 @@ fn execute<'a, 'b: 'a>(
 
 pub mod test_utils {
     use {
-        super::*, solana_program_runtime::loaded_programs::DELAY_VISIBILITY_SLOT_OFFSET,
-        solana_sdk::account::ReadableAccount,
+        super::*,
+        solana_program_runtime::loaded_programs::DELAY_VISIBILITY_SLOT_OFFSET,
+        solana_sdk::{account::ReadableAccount, loader_v4::LoaderV4State},
     };
 
     pub fn load_all_invoked_programs(invoke_context: &mut InvokeContext) {
@@ -1537,6 +1555,11 @@ pub mod test_utils {
 
             let owner = account.owner();
             if check_loader_id(owner) {
+                let programdata_data_offset = if loader_v4::check_id(owner) {
+                    LoaderV4State::program_data_offset()
+                } else {
+                    0
+                };
                 let pubkey = invoke_context
                     .transaction_context
                     .get_key_of_account_at_index(index)
@@ -1545,7 +1568,10 @@ pub mod test_utils {
                 if let Ok(loaded_program) = load_program_from_bytes(
                     None,
                     &mut load_program_metrics,
-                    account.data(),
+                    account
+                        .data()
+                        .get(programdata_data_offset.min(account.data().len())..)
+                        .unwrap(),
                     owner,
                     account.data().len(),
                     0,
@@ -3578,7 +3604,7 @@ mod tests {
         program_account = accounts.get(3).unwrap().clone();
         process_instruction(
             &loader_id,
-            &[0, 1],
+            &[1],
             &[],
             vec![
                 (programdata_address, programdata_account.clone()),

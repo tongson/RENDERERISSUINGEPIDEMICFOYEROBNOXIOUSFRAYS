@@ -2,16 +2,14 @@
 
 use {
     crate::config::RpcSimulateTransactionAccountsConfig,
-    solana_account_decoder::UiAccount,
-    solana_bundle::{bundle_execution::LoadAndExecuteBundleError, BundleExecutionError, TipError},
+    solana_account_decoder_client_types::UiAccount,
     solana_sdk::{
         clock::Slot,
         commitment_config::{CommitmentConfig, CommitmentLevel},
         signature::Signature,
         transaction::TransactionError,
     },
-    solana_svm::transaction_results::TransactionExecutionResult,
-    solana_transaction_status::{UiTransactionEncoding, UiTransactionReturnData},
+    solana_transaction_status_client_types::{UiTransactionEncoding, UiTransactionReturnData},
     thiserror::Error,
 };
 
@@ -51,55 +49,6 @@ pub enum RpcBundleExecutionError {
 
     #[error("A transaction in the bundle failed to execute: [signature={0}, error={1}]")]
     TransactionFailure(Signature, String),
-}
-
-impl From<BundleExecutionError> for RpcBundleExecutionError {
-    fn from(bundle_execution_error: BundleExecutionError) -> Self {
-        match bundle_execution_error {
-            BundleExecutionError::BankProcessingTimeLimitReached => {
-                Self::BankProcessingTimeLimitReached
-            }
-            BundleExecutionError::ExceedsCostModel => Self::ExceedsCostModel,
-            BundleExecutionError::TransactionFailure(load_and_execute_bundle_error) => {
-                match load_and_execute_bundle_error {
-                    LoadAndExecuteBundleError::ProcessingTimeExceeded(_) => {
-                        Self::BundleExecutionTimeout
-                    }
-                    LoadAndExecuteBundleError::LockError {
-                        signature,
-                        transaction_error,
-                    } => Self::TransactionFailure(signature, transaction_error.to_string()),
-                    LoadAndExecuteBundleError::TransactionError {
-                        signature,
-                        execution_result,
-                    } => match *execution_result {
-                        TransactionExecutionResult::Executed { details, .. } => {
-                            let err_msg = if let Err(e) = details.status {
-                                e.to_string()
-                            } else {
-                                "Unknown error".to_string()
-                            };
-                            Self::TransactionFailure(signature, err_msg)
-                        }
-                        TransactionExecutionResult::NotExecuted(e) => {
-                            Self::TransactionFailure(signature, e.to_string())
-                        }
-                    },
-                    LoadAndExecuteBundleError::InvalidPreOrPostAccounts => {
-                        Self::InvalidPreOrPostAccounts
-                    }
-                    LoadAndExecuteBundleError::AccountInUse => Self::BundleExecutionTimeout,
-                }
-            }
-            BundleExecutionError::LockError => Self::BundleLockError,
-            BundleExecutionError::PohRecordError(e) => Self::PohRecordError(e.to_string()),
-            BundleExecutionError::TipError(e) => Self::TipError(e.to_string()),
-            // NB: Lie about the error as to not break downstream consumers.
-            BundleExecutionError::TipTooLow | BundleExecutionError::FrontRun => {
-                Self::TipError(TipError::CrankTipError.to_string())
-            }
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

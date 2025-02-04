@@ -6,28 +6,27 @@ use {
         iter::IndexedParallelIterator,
         prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     },
+    solana_feature_set::apply_cost_tracker_during_replay,
     solana_ledger::{
         blockstore_processor::{execute_batch, TransactionBatchWithIndexes},
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
     },
-    solana_program_runtime::timings::ExecuteTimings,
     solana_runtime::{
-        bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
-        transaction_batch::TransactionBatch,
+        bank::Bank,
+        bank_forks::BankForks,
+        prioritization_fee_cache::PrioritizationFeeCache,
+        transaction_batch::{OwnedOrBorrowed, TransactionBatch},
     },
     solana_sdk::{
         account::{Account, ReadableAccount},
-        feature_set::apply_cost_tracker_during_replay,
         signature::Keypair,
         signer::Signer,
         stake_history::Epoch,
         system_program, system_transaction,
         transaction::SanitizedTransaction,
     },
-    std::{
-        borrow::Cow,
-        sync::{Arc, RwLock},
-    },
+    solana_timings::ExecuteTimings,
+    std::sync::{Arc, RwLock},
     test::Bencher,
 };
 
@@ -136,8 +135,11 @@ fn bench_execute_batch(
     let batches: Vec<_> = transactions
         .chunks(batch_size)
         .map(|txs| {
-            let mut batch =
-                TransactionBatch::new(vec![Ok(()); txs.len()], &bank, Cow::Borrowed(txs));
+            let mut batch = TransactionBatch::new(
+                vec![Ok(()); txs.len()],
+                &bank,
+                OwnedOrBorrowed::Borrowed(txs),
+            );
             batch.set_needs_unlock(false);
             TransactionBatchWithIndexes {
                 batch,

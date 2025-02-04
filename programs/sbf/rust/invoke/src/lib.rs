@@ -65,7 +65,7 @@ fn do_nested_invokes(num_nested_invokes: u64, accounts: &[AccountInfo]) -> Progr
     Ok(())
 }
 
-solana_program::entrypoint!(process_instruction);
+solana_program::entrypoint_no_alloc!(process_instruction);
 fn process_instruction<'a>(
     program_id: &Pubkey,
     accounts: &[AccountInfo<'a>],
@@ -461,11 +461,20 @@ fn process_instruction<'a>(
             invoked_instruction.accounts[0].is_writable = true;
             invoke(&invoked_instruction, accounts)?;
         }
+        TEST_PPROGRAM_NOT_OWNED_BY_LOADER => {
+            msg!("Test program not owned by loader");
+            let instruction = create_instruction(
+                *accounts[ARGUMENT_INDEX].key,
+                &[(accounts[INVOKED_ARGUMENT_INDEX].key, false, false)],
+                vec![RETURN_OK],
+            );
+            invoke(&instruction, accounts)?;
+        }
         TEST_PPROGRAM_NOT_EXECUTABLE => {
             msg!("Test program not executable");
             let instruction = create_instruction(
-                *accounts[ARGUMENT_INDEX].key,
-                &[(accounts[ARGUMENT_INDEX].key, true, true)],
+                *accounts[UNEXECUTABLE_PROGRAM_INDEX].key,
+                &[(accounts[INVOKED_ARGUMENT_INDEX].key, false, false)],
                 vec![RETURN_OK],
             );
             invoke(&instruction, accounts)?;
@@ -1127,7 +1136,7 @@ fn process_instruction<'a>(
             let account = &accounts[ARGUMENT_INDEX];
             let key = *account.key;
             let key = &key as *const _ as usize;
-            #[rustversion::attr(since(1.72), allow(invalid_reference_casting))]
+            #[allow(invalid_reference_casting)]
             fn overwrite_account_key(account: &AccountInfo, key: *const Pubkey) {
                 unsafe {
                     let ptr = mem::transmute::<_, *mut *const Pubkey>(&account.key);
@@ -1178,7 +1187,7 @@ fn process_instruction<'a>(
             const CALLEE_PROGRAM_INDEX: usize = 2;
             let account = &accounts[ARGUMENT_INDEX];
             let owner = account.owner as *const _ as usize + 1;
-            #[rustversion::attr(since(1.72), allow(invalid_reference_casting))]
+            #[allow(invalid_reference_casting)]
             fn overwrite_account_owner(account: &AccountInfo, owner: *const Pubkey) {
                 unsafe {
                     let ptr = mem::transmute::<_, *mut *const Pubkey>(&account.owner);
@@ -1353,19 +1362,46 @@ fn process_instruction<'a>(
         TEST_CALLEE_ACCOUNT_UPDATES => {
             msg!("TEST_CALLEE_ACCOUNT_UPDATES");
 
-            if instruction_data.len() < 2 + 2 * std::mem::size_of::<usize>() {
+            if instruction_data.len() < 3 + 3 * std::mem::size_of::<usize>() {
                 return Ok(());
             }
 
             let writable = instruction_data[1] != 0;
-            let resize = usize::from_le_bytes(instruction_data[2..10].try_into().unwrap());
-            let write_offset = usize::from_le_bytes(instruction_data[10..18].try_into().unwrap());
-            let invoke_struction = &instruction_data[18..];
+            let clone_data = instruction_data[2] != 0;
+            let resize = usize::from_le_bytes(instruction_data[3..11].try_into().unwrap());
+            let pre_write_offset =
+                usize::from_le_bytes(instruction_data[11..19].try_into().unwrap());
+            let post_write_offset =
+                usize::from_le_bytes(instruction_data[19..27].try_into().unwrap());
+            let invoke_struction = &instruction_data[27..];
+
+            let old_data = if clone_data {
+                let prev = accounts[ARGUMENT_INDEX].try_borrow_data().unwrap().as_ptr();
+
+                let data = accounts[ARGUMENT_INDEX].try_borrow_data().unwrap().to_vec();
+
+                let old = accounts[ARGUMENT_INDEX].data.replace(data.leak());
+
+                let post = accounts[ARGUMENT_INDEX].try_borrow_data().unwrap().as_ptr();
+
+                if prev == post {
+                    panic!("failed to clone the data");
+                }
+
+                Some(old)
+            } else {
+                None
+            };
 
             let account = &accounts[ARGUMENT_INDEX];
 
             if resize != 0 {
                 account.realloc(resize, false).unwrap();
+            }
+
+            if pre_write_offset != 0 {
+                // Ensure we still have access to the correct account
+                account.data.borrow_mut()[pre_write_offset] ^= 0xe5;
             }
 
             if !invoke_struction.is_empty() {
@@ -1388,9 +1424,13 @@ fn process_instruction<'a>(
                 .unwrap();
             }
 
-            if write_offset != 0 {
-                // Ensure we still have access to the correct account
-                account.data.borrow_mut()[write_offset] ^= 0xe5;
+            if post_write_offset != 0 {
+                if let Some(old) = old_data {
+                    old[post_write_offset] ^= 0xe5;
+                } else {
+                    // Ensure we still have access to the correct account
+                    account.data.borrow_mut()[post_write_offset] ^= 0xe5;
+                }
             }
         }
         TEST_STACK_HEAP_ZEROED => {
@@ -1444,6 +1484,116 @@ fn process_instruction<'a>(
             )
             .unwrap();
         }
+        TEST_ACCOUNT_INFO_IN_ACCOUNT => {
+            msg!("TEST_ACCOUNT_INFO_IN_ACCOUNT");
+
+            let account_offset = usize::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+
+            let mut instruction_data = vec![TEST_WRITE_ACCOUNT, 1];
+            instruction_data.extend_from_slice(&1u64.to_le_bytes());
+            instruction_data.push(1);
+
+            let data = accounts[ARGUMENT_INDEX].data.borrow().as_ptr();
+            let len = accounts.len();
+
+            let account_info_in_account: &mut [AccountInfo] = unsafe {
+                std::slice::from_raw_parts_mut(data.add(account_offset) as *mut AccountInfo, len)
+            };
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    accounts.as_ptr(),
+                    account_info_in_account.as_mut_ptr(),
+                    len,
+                );
+            }
+
+            invoke(
+                &create_instruction(
+                    *program_id,
+                    &[
+                        (program_id, false, false),
+                        (accounts[1].key, true, false),
+                        (accounts[0].key, false, false),
+                    ],
+                    instruction_data.to_vec(),
+                ),
+                account_info_in_account,
+            )
+            .unwrap();
+        }
+        TEST_ACCOUNT_INFO_LAMPORTS_RC => {
+            msg!("TEST_ACCOUNT_INFO_LAMPORTS_RC_IN_ACCOUNT");
+
+            let mut account0 = accounts[0].clone();
+            let account1 = accounts[1].clone();
+            let account2 = accounts[2].clone();
+
+            account0.lamports = unsafe {
+                let dst = account1.data.borrow_mut().as_mut_ptr();
+                // 32 = size_of::<RcBox>()
+                std::ptr::copy(
+                    std::mem::transmute::<Rc<RefCell<&mut u64>>, *const u8>(account0.lamports),
+                    dst,
+                    32,
+                );
+                std::mem::transmute::<*mut u8, Rc<RefCell<&mut u64>>>(dst)
+            };
+
+            let mut instruction_data = vec![TEST_WRITE_ACCOUNT, 1];
+            instruction_data.extend_from_slice(&1u64.to_le_bytes());
+            instruction_data.push(1);
+
+            invoke(
+                &create_instruction(
+                    *program_id,
+                    &[
+                        (program_id, false, false),
+                        (accounts[1].key, true, false),
+                        (accounts[0].key, false, false),
+                    ],
+                    instruction_data.to_vec(),
+                ),
+                &[account0, account1, account2],
+            )
+            .unwrap();
+        }
+        TEST_ACCOUNT_INFO_DATA_RC => {
+            msg!("TEST_ACCOUNT_INFO_DATA_RC_IN_ACCOUNT");
+
+            let mut account0 = accounts[0].clone();
+            let account1 = accounts[1].clone();
+            let account2 = accounts[2].clone();
+
+            account0.data = unsafe {
+                let dst = account1.data.borrow_mut().as_mut_ptr();
+                // 32 = size_of::<RcBox>()
+                std::ptr::copy(
+                    std::mem::transmute::<Rc<RefCell<&mut [u8]>>, *const u8>(account0.data),
+                    dst,
+                    32,
+                );
+                std::mem::transmute::<*mut u8, Rc<RefCell<&mut [u8]>>>(dst)
+            };
+
+            let mut instruction_data = vec![TEST_WRITE_ACCOUNT, 1];
+            instruction_data.extend_from_slice(&1u64.to_le_bytes());
+            instruction_data.push(1);
+
+            invoke(
+                &create_instruction(
+                    *program_id,
+                    &[
+                        (program_id, false, false),
+                        (accounts[1].key, true, false),
+                        (accounts[0].key, false, false),
+                    ],
+                    instruction_data.to_vec(),
+                ),
+                &[account0, account1, account2],
+            )
+            .unwrap();
+        }
         _ => panic!("unexpected program data"),
     }
 
@@ -1457,7 +1607,7 @@ struct RcBox<T> {
     value: T,
 }
 
-#[rustversion::attr(since(1.72), allow(invalid_reference_casting))]
+#[allow(invalid_reference_casting)]
 unsafe fn overwrite_account_data(account: &AccountInfo, data: Rc<RefCell<&mut [u8]>>) {
     std::ptr::write_volatile(
         &account.data as *const _ as usize as *mut Rc<RefCell<&mut [u8]>>,

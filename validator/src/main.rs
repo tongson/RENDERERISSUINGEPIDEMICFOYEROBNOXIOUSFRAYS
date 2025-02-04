@@ -1,5 +1,4 @@
 #![allow(clippy::arithmetic_side_effects)]
-
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use {
@@ -22,10 +21,13 @@ use {
         accounts_file::StorageAccess,
         accounts_index::{
             AccountIndex, AccountSecondaryIndexes, AccountSecondaryIndexesIncludeExclude,
-            AccountsIndexConfig, IndexLimitMb,
+            AccountsIndexConfig, IndexLimitMb, ScanFilter,
         },
         partitioned_rewards::TestPartitionedEpochRewards,
-        utils::{create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories},
+        utils::{
+            create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories,
+            create_and_canonicalize_directory,
+        },
     },
     solana_clap_utils::input_parsers::{keypair_of, keypairs_of, pubkey_of, value_of, values_of},
     solana_core::{
@@ -38,7 +40,7 @@ use {
         tpu::DEFAULT_TPU_COALESCE,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod, Validator,
-            ValidatorConfig, ValidatorStartProgress,
+            ValidatorConfig, ValidatorError, ValidatorStartProgress,
         },
     },
     solana_gossip::{
@@ -1074,6 +1076,18 @@ pub fn main() {
         _ => unreachable!(),
     };
 
+    let cli::thread_args::NumThreadConfig {
+        accounts_db_clean_threads,
+        accounts_db_foreground_threads,
+        accounts_db_hash_threads,
+        accounts_index_flush_threads,
+        ip_echo_server_threads,
+        replay_forks_threads,
+        replay_transactions_threads,
+        tvu_receive_threads,
+        tvu_sigverify_threads,
+    } = cli::thread_args::parse_num_threads_args(&matches);
+
     let identity_keypair = keypair_of(&matches, "identity").unwrap_or_else(|| {
         clap::Error::with_description(
             "The --identity <KEYPAIR> argument is required",
@@ -1263,7 +1277,7 @@ pub fn main() {
         exit(1);
     }
 
-    let accounts_shrink_ratio = if accounts_shrink_optimize_total_space {
+    let shrink_ratio = if accounts_shrink_optimize_total_space {
         AccountShrinkThreshold::TotalSpace { shrink_ratio }
     } else {
         AccountShrinkThreshold::IndividualStore { shrink_ratio }
@@ -1337,6 +1351,7 @@ pub fn main() {
 
     let mut accounts_index_config = AccountsIndexConfig {
         started_from_validator: true, // this is the only place this is set
+        num_flush_threads: Some(accounts_index_flush_threads),
         ..AccountsIndexConfig::default()
     };
     if let Ok(bins) = value_t!(matches, "accounts_index_bins", usize) {
@@ -1352,14 +1367,11 @@ pub fn main() {
             TestPartitionedEpochRewards::None
         };
 
-    accounts_index_config.index_limit_mb =
-        if let Ok(limit) = value_t!(matches, "accounts_index_memory_limit_mb", usize) {
-            IndexLimitMb::Limit(limit)
-        } else if matches.is_present("disable_accounts_disk_index") {
-            IndexLimitMb::InMemOnly
-        } else {
-            IndexLimitMb::Unspecified
-        };
+    accounts_index_config.index_limit_mb = if matches.is_present("disable_accounts_disk_index") {
+        IndexLimitMb::InMemOnly
+    } else {
+        IndexLimitMb::Unlimited
+    };
 
     {
         let mut accounts_index_paths: Vec<PathBuf> = if matches.is_present("accounts_index_path") {
@@ -1439,11 +1451,26 @@ pub fn main() {
         })
         .unwrap_or_default();
 
+    let scan_filter_for_shrinking = matches
+        .value_of("accounts_db_scan_filter_for_shrinking")
+        .map(|filter| match filter {
+            "all" => ScanFilter::All,
+            "only-abnormal" => ScanFilter::OnlyAbnormal,
+            "only-abnormal-with-verify" => ScanFilter::OnlyAbnormalWithVerify,
+            _ => {
+                // clap will enforce one of the above values is given
+                unreachable!("invalid value given to accounts_db_scan_filter_for_shrinking")
+            }
+        })
+        .unwrap_or_default();
+
     let accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
+        account_indexes: Some(account_indexes.clone()),
         base_working_path: Some(ledger_path.clone()),
         accounts_hash_cache_path: Some(accounts_hash_cache_path),
         shrink_paths: account_shrink_run_paths,
+        shrink_ratio,
         read_cache_limit_bytes,
         write_cache_limit_bytes: value_t!(matches, "accounts_db_cache_limit_mb", u64)
             .ok()
@@ -1455,6 +1482,12 @@ pub fn main() {
         test_skip_rewrites_but_include_in_bank_hash: matches
             .is_present("accounts_db_test_skip_rewrites"),
         storage_access,
+        scan_filter_for_shrinking,
+        enable_experimental_accumulator_hash: matches
+            .is_present("accounts_db_experimental_accumulator_hash"),
+        num_clean_threads: Some(accounts_db_clean_threads),
+        num_foreground_threads: Some(accounts_db_foreground_threads),
+        num_hash_threads: Some(accounts_db_hash_threads),
         ..AccountsDbConfig::default()
     };
 
@@ -1468,7 +1501,7 @@ pub fn main() {
                 .collect(),
         )
     } else {
-        None
+        value_t_or_exit!(matches, "geyser_plugin_always_enabled", bool).then(Vec::new)
     };
     let starting_with_geyser_plugins: bool = on_start_geyser_plugin_config_files.is_some();
 
@@ -1538,13 +1571,6 @@ pub fn main() {
         };
 
     let full_api = matches.is_present("full_rpc_api");
-
-    let cli::thread_args::NumThreadConfig {
-        ip_echo_server_threads,
-        replay_forks_threads,
-        replay_transactions_threads,
-        tvu_receive_threads,
-    } = cli::thread_args::parse_num_threads_args(&matches);
 
     let voting_disabled = matches.is_present("no_voting") || restricted_repair_only_mode;
     let tip_manager_config = tip_manager_config_from_matches(&matches, voting_disabled);
@@ -1623,6 +1649,7 @@ pub fn main() {
             ),
             disable_health_check: false,
             rpc_threads: value_t_or_exit!(matches, "rpc_threads", usize),
+            rpc_blocking_threads: value_t_or_exit!(matches, "rpc_blocking_threads", usize),
             rpc_niceness_adj: value_t_or_exit!(matches, "rpc_niceness_adj", i8),
             account_indexes: account_indexes.clone(),
             rpc_scan_and_fix_roots: matches.is_present("rpc_scan_and_fix_roots"),
@@ -1631,6 +1658,7 @@ pub fn main() {
                 "rpc_max_request_body_size",
                 usize
             )),
+            skip_preflight_health_check: matches.is_present("skip_preflight_health_check"),
         },
         on_start_geyser_plugin_config_files,
         rpc_addrs: value_t!(matches, "rpc_port", u16).ok().map(|rpc_port| {
@@ -1709,14 +1737,12 @@ pub fn main() {
         poh_hashes_per_batch: value_of(&matches, "poh_hashes_per_batch")
             .unwrap_or(poh_service::DEFAULT_HASHES_PER_BATCH),
         process_ledger_before_services: matches.is_present("process_ledger_before_services"),
-        account_indexes,
         accounts_db_test_hash_calculation: matches.is_present("accounts_db_test_hash_calculation"),
         accounts_db_config,
         accounts_db_skip_shrink: true,
         accounts_db_force_initial_clean: matches.is_present("no_skip_initial_accounts_db_clean"),
         tpu_coalesce,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
-        accounts_shrink_ratio,
         runtime_config: RuntimeConfig {
             log_messages_bytes_limit: value_of(&matches, "log_messages_bytes_limit"),
             ..RuntimeConfig::default()
@@ -1745,8 +1771,11 @@ pub fn main() {
         ip_echo_server_threads,
         replay_forks_threads,
         replay_transactions_threads,
+        tvu_shred_sigverify_threads: tvu_sigverify_threads,
         delay_leader_block_for_pending_fork: matches
             .is_present("delay_leader_block_for_pending_fork"),
+        wen_restart_proto_path: value_t!(matches, "wen_restart", PathBuf).ok(),
+        wen_restart_coordinator: value_t!(matches, "wen_restart_coordinator", Pubkey).ok(),
         preallocated_bundle_cost: value_of(&matches, "preallocated_bundle_cost")
             .expect("preallocated_bundle_cost set as default"),
         p3_socket,
@@ -1820,6 +1849,24 @@ pub fn main() {
     } else {
         &ledger_path
     };
+    let snapshots_dir = create_and_canonicalize_directory(snapshots_dir).unwrap_or_else(|err| {
+        eprintln!(
+            "Failed to create snapshots directory '{}': {err}",
+            snapshots_dir.display(),
+        );
+        exit(1);
+    });
+
+    if account_paths
+        .iter()
+        .any(|account_path| account_path == &snapshots_dir)
+    {
+        eprintln!(
+            "Failed: The --accounts and --snapshots paths must be unique since they \
+             both create 'snapshots' subdirectories, otherwise there may be collisions",
+        );
+        exit(1);
+    }
 
     let bank_snapshots_dir = snapshots_dir.join("snapshots");
     fs::create_dir_all(&bank_snapshots_dir).unwrap_or_else(|err| {
@@ -1830,13 +1877,12 @@ pub fn main() {
         exit(1);
     });
 
-    let full_snapshot_archives_dir = PathBuf::from(
+    let full_snapshot_archives_dir =
         if let Some(full_snapshot_archive_path) = matches.value_of("full_snapshot_archive_path") {
-            Path::new(full_snapshot_archive_path)
+            PathBuf::from(full_snapshot_archive_path)
         } else {
-            snapshots_dir
-        },
-    );
+            snapshots_dir.clone()
+        };
     fs::create_dir_all(&full_snapshot_archives_dir).unwrap_or_else(|err| {
         eprintln!(
             "Failed to create full snapshot archives directory '{}': {err}",
@@ -1845,15 +1891,13 @@ pub fn main() {
         exit(1);
     });
 
-    let incremental_snapshot_archives_dir = PathBuf::from(
-        if let Some(incremental_snapshot_archive_path) =
-            matches.value_of("incremental_snapshot_archive_path")
-        {
-            Path::new(incremental_snapshot_archive_path)
-        } else {
-            snapshots_dir
-        },
-    );
+    let incremental_snapshot_archives_dir = if let Some(incremental_snapshot_archive_path) =
+        matches.value_of("incremental_snapshot_archive_path")
+    {
+        PathBuf::from(incremental_snapshot_archive_path)
+    } else {
+        snapshots_dir.clone()
+    };
     fs::create_dir_all(&incremental_snapshot_archives_dir).unwrap_or_else(|err| {
         eprintln!(
             "Failed to create incremental snapshot archives directory '{}': {err}",
@@ -2181,6 +2225,7 @@ pub fn main() {
                 })
             });
 
+    let num_quic_endpoints = value_t_or_exit!(matches, "num_quic_endpoints", NonZeroUsize);
     let node_config = NodeConfig {
         gossip_addr,
         port_range: dynamic_port_range,
@@ -2188,6 +2233,7 @@ pub fn main() {
         public_tpu_addr,
         public_tpu_forwards_addr,
         num_tvu_sockets: tvu_receive_threads,
+        num_quic_endpoints,
     };
 
     let cluster_entrypoints = entrypoint_addrs
@@ -2198,6 +2244,11 @@ pub fn main() {
     let mut node = Node::new_with_external_ip(&identity_keypair.pubkey(), node_config);
 
     if restricted_repair_only_mode {
+        if validator_config.wen_restart_proto_path.is_some() {
+            error!("--restricted-repair-only-mode is not compatible with --wen_restart");
+            exit(1);
+        }
+
         // When in --restricted_repair_only_mode is enabled only the gossip and repair ports
         // need to be reachable by the entrypoint to respond to gossip pull requests and repair
         // requests initiated by the node.  All other ports are unused.
@@ -2278,7 +2329,7 @@ pub fn main() {
     // the one pushed by bootstrap.
     node.info.hot_swap_pubkey(identity_keypair.pubkey());
 
-    let validator = Validator::new(
+    let validator = match Validator::new(
         node,
         identity_keypair,
         &ledger_path,
@@ -2296,11 +2347,19 @@ pub fn main() {
         tpu_max_connections_per_ipaddr_per_minute,
         admin_service_post_init,
         Some(runtime_plugin_config_and_rpc_rx),
-    )
-    .unwrap_or_else(|e| {
-        error!("Failed to start validator: {:?}", e);
-        exit(1);
-    });
+    ) {
+        Ok(validator) => validator,
+        Err(err) => match err.downcast_ref() {
+            Some(ValidatorError::WenRestartFinished) => {
+                error!("Please remove --wen_restart and use --wait_for_supermajority as instructed above");
+                exit(200);
+            }
+            _ => {
+                error!("Failed to start validator: {:?}", err);
+                exit(1);
+            }
+        },
+    };
 
     if let Some(filename) = init_complete_file {
         File::create(filename).unwrap_or_else(|_| {
@@ -2367,6 +2426,7 @@ fn tip_manager_config_from_matches(
     voting_disabled: bool,
 ) -> TipManagerConfig {
     TipManagerConfig {
+        funnel: pubkey_of(matches, "funnel"),
         tip_payment_program_id: pubkey_of(matches, "tip_payment_program_pubkey").unwrap_or_else(
             || {
                 if !voting_disabled {

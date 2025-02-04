@@ -20,21 +20,21 @@ use {
             consume_worker::ConsumeWorker,
             packet_deserializer::PacketDeserializer,
             transaction_scheduler::{
-                prio_graph_scheduler::PrioGraphScheduler,
-                scheduler_controller::SchedulerController, scheduler_error::SchedulerError,
+                greedy_scheduler::GreedyScheduler, scheduler_controller::SchedulerController,
+                scheduler_error::SchedulerError,
             },
         },
         banking_trace::BankingPacketReceiver,
+        bundle_stage::bundle_account_locker::BundleAccountLocker,
         tracer_packet_stats::TracerPacketStats,
         validator::BlockProductionMethod,
     },
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
     histogram::Histogram,
-    solana_bundle::bundle_account_locker::BundleAccountLocker,
     solana_client::connection_cache::ConnectionCache,
-    solana_gossip::cluster_info::ClusterInfo,
+    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_ledger::blockstore_processor::TransactionStatusSender,
-    solana_measure::{measure, measure_us},
+    solana_measure::measure_us,
     solana_perf::{data_budget::DataBudget, packet::PACKETS_PER_BATCH},
     solana_poh::poh_recorder::{PohRecorder, TransactionRecorder},
     solana_runtime::{
@@ -46,6 +46,7 @@ use {
         cmp,
         collections::HashSet,
         env,
+        ops::Deref,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, RwLock,
@@ -67,23 +68,21 @@ pub mod unprocessed_transaction_storage;
 mod consume_worker;
 pub(crate) mod decision_maker;
 mod forward_packet_batches_by_accounts;
-mod forward_worker;
 pub(crate) mod immutable_deserialized_packet;
 mod latest_unprocessed_votes;
 pub(crate) mod leader_slot_timing_metrics;
 mod multi_iterator_scanner;
 mod packet_deserializer;
-mod packet_filter;
+pub(crate) mod packet_filter;
 mod packet_receiver;
 mod read_write_account_set;
-#[allow(dead_code)]
 mod scheduler_messages;
-mod transaction_scheduler;
+pub(crate) mod transaction_scheduler;
 
 // Fixed thread size seems to be fastest on GCP setup
 pub const NUM_THREADS: u32 = 6;
 
-const TOTAL_BUFFERED_PACKETS: usize = 700_000;
+const TOTAL_BUFFERED_PACKETS: usize = 100_000;
 
 const NUM_VOTE_PROCESSING_THREADS: u32 = 2;
 const MIN_THREADS_BANKING: u32 = 1;
@@ -326,12 +325,33 @@ pub struct FilterForwardingResults {
     pub(crate) total_filter_packets_us: u64,
 }
 
+pub trait LikeClusterInfo: Send + Sync + 'static + Clone {
+    fn id(&self) -> Pubkey;
+
+    fn lookup_contact_info<F, Y>(&self, id: &Pubkey, map: F) -> Option<Y>
+    where
+        F: FnOnce(&ContactInfo) -> Y;
+}
+
+impl LikeClusterInfo for Arc<ClusterInfo> {
+    fn id(&self) -> Pubkey {
+        self.deref().id()
+    }
+
+    fn lookup_contact_info<F, Y>(&self, id: &Pubkey, map: F) -> Option<Y>
+    where
+        F: FnOnce(&ContactInfo) -> Y,
+    {
+        self.deref().lookup_contact_info(id, map)
+    }
+}
+
 impl BankingStage {
     /// Create the stage using `bank`. Exit when `verified_receiver` is dropped.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         block_production_method: BlockProductionMethod,
-        cluster_info: &Arc<ClusterInfo>,
+        cluster_info: &impl LikeClusterInfo,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         non_vote_receiver: BankingPacketReceiver,
         tpu_vote_receiver: BankingPacketReceiver,
@@ -369,7 +389,7 @@ impl BankingStage {
     #[allow(clippy::too_many_arguments)]
     pub fn new_num_threads(
         block_production_method: BlockProductionMethod,
-        cluster_info: &Arc<ClusterInfo>,
+        cluster_info: &impl LikeClusterInfo,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         non_vote_receiver: BankingPacketReceiver,
         tpu_vote_receiver: BankingPacketReceiver,
@@ -426,7 +446,7 @@ impl BankingStage {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_thread_local_multi_iterator(
-        cluster_info: &Arc<ClusterInfo>,
+        cluster_info: &impl LikeClusterInfo,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         non_vote_receiver: BankingPacketReceiver,
         tpu_vote_receiver: BankingPacketReceiver,
@@ -500,7 +520,6 @@ impl BankingStage {
                 Self::spawn_thread_local_multi_iterator_thread(
                     id,
                     packet_receiver,
-                    bank_forks.clone(),
                     decision_maker.clone(),
                     committer.clone(),
                     transaction_recorder.clone(),
@@ -517,7 +536,7 @@ impl BankingStage {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_central_scheduler(
-        cluster_info: &Arc<ClusterInfo>,
+        cluster_info: &impl LikeClusterInfo,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         non_vote_receiver: BankingPacketReceiver,
         tpu_vote_receiver: BankingPacketReceiver,
@@ -563,7 +582,6 @@ impl BankingStage {
             bank_thread_hdls.push(Self::spawn_thread_local_multi_iterator_thread(
                 id,
                 packet_receiver,
-                bank_forks.clone(),
                 decision_maker.clone(),
                 committer.clone(),
                 transaction_recorder.clone(),
@@ -632,9 +650,8 @@ impl BankingStage {
 
         // Spawn the central scheduler thread
         bank_thread_hdls.push({
-            let packet_deserializer =
-                PacketDeserializer::new(non_vote_receiver, bank_forks.clone());
-            let scheduler = PrioGraphScheduler::new(work_senders, finished_work_receiver);
+            let packet_deserializer = PacketDeserializer::new(non_vote_receiver);
+            let scheduler = GreedyScheduler::new(work_senders, finished_work_receiver);
             let scheduler_controller = SchedulerController::new(
                 decision_maker.clone(),
                 packet_deserializer,
@@ -659,21 +676,19 @@ impl BankingStage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn spawn_thread_local_multi_iterator_thread(
+    fn spawn_thread_local_multi_iterator_thread<T: LikeClusterInfo>(
         id: u32,
         packet_receiver: BankingPacketReceiver,
-        bank_forks: Arc<RwLock<BankForks>>,
         decision_maker: DecisionMaker,
         committer: Committer,
         transaction_recorder: TransactionRecorder,
         log_messages_bytes_limit: Option<usize>,
-        mut forwarder: Forwarder,
+        mut forwarder: Forwarder<T>,
         unprocessed_transaction_storage: UnprocessedTransactionStorage,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
     ) -> JoinHandle<()> {
-        let mut packet_receiver = PacketReceiver::new(id, packet_receiver, bank_forks);
-
+        let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
         let consumer = Consumer::new(
             committer,
             transaction_recorder,
@@ -699,9 +714,9 @@ impl BankingStage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn process_buffered_packets(
+    fn process_buffered_packets<T: LikeClusterInfo>(
         decision_maker: &DecisionMaker,
-        forwarder: &mut Forwarder,
+        forwarder: &mut Forwarder<T>,
         consumer: &Consumer,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         banking_stage_stats: &BankingStageStats,
@@ -711,13 +726,13 @@ impl BankingStage {
         if unprocessed_transaction_storage.should_not_process() {
             return;
         }
-        let (decision, make_decision_time) =
-            measure!(decision_maker.make_consume_or_forward_decision());
+        let (decision, make_decision_us) =
+            measure_us!(decision_maker.make_consume_or_forward_decision());
         let metrics_action = slot_metrics_tracker.check_leader_slot_boundary(
             decision.bank_start(),
             Some(unprocessed_transaction_storage),
         );
-        slot_metrics_tracker.increment_make_decision_us(make_decision_time.as_us());
+        slot_metrics_tracker.increment_make_decision_us(make_decision_us);
 
         match decision {
             BufferedPacketsDecision::Consume(bank_start) => {
@@ -726,17 +741,15 @@ impl BankingStage {
                 // packet processing metrics from the next slot towards the metrics
                 // of the previous slot
                 slot_metrics_tracker.apply_action(metrics_action);
-                let (_, consume_buffered_packets_time) = measure!(
-                    consumer.consume_buffered_packets(
+                let (_, consume_buffered_packets_us) = measure_us!(consumer
+                    .consume_buffered_packets(
                         &bank_start,
                         unprocessed_transaction_storage,
                         banking_stage_stats,
                         slot_metrics_tracker,
-                    ),
-                    "consume_buffered_packets",
-                );
+                    ));
                 slot_metrics_tracker
-                    .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
+                    .increment_consume_buffered_packets_us(consume_buffered_packets_us);
             }
             BufferedPacketsDecision::Forward => {
                 let ((), forward_us) = measure_us!(forwarder.handle_forwarding(
@@ -767,10 +780,10 @@ impl BankingStage {
         }
     }
 
-    fn process_loop(
+    fn process_loop<T: LikeClusterInfo>(
         packet_receiver: &mut PacketReceiver,
         decision_maker: &DecisionMaker,
-        forwarder: &mut Forwarder,
+        forwarder: &mut Forwarder<T>,
         consumer: &Consumer,
         id: u32,
         mut unprocessed_transaction_storage: UnprocessedTransactionStorage,
@@ -785,20 +798,17 @@ impl BankingStage {
             if !unprocessed_transaction_storage.is_empty()
                 || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
             {
-                let (_, process_buffered_packets_time) = measure!(
-                    Self::process_buffered_packets(
-                        decision_maker,
-                        forwarder,
-                        consumer,
-                        &mut unprocessed_transaction_storage,
-                        &banking_stage_stats,
-                        &mut slot_metrics_tracker,
-                        &mut tracer_packet_stats,
-                    ),
-                    "process_buffered_packets",
-                );
+                let (_, process_buffered_packets_us) = measure_us!(Self::process_buffered_packets(
+                    decision_maker,
+                    forwarder,
+                    consumer,
+                    &mut unprocessed_transaction_storage,
+                    &banking_stage_stats,
+                    &mut slot_metrics_tracker,
+                    &mut tracer_packet_stats,
+                ));
                 slot_metrics_tracker
-                    .increment_process_buffered_packets_us(process_buffered_packets_time.as_us());
+                    .increment_process_buffered_packets_us(process_buffered_packets_us);
                 last_metrics_update = Instant::now();
             }
 
@@ -1483,7 +1493,7 @@ mod tests {
                         &vote_keypairs[i],
                         &vote_keypairs[i],
                         None,
-                    );
+                    )
                 })
                 .collect_vec();
             let gossip_votes = (0..100_usize)
@@ -1500,7 +1510,7 @@ mod tests {
                         &vote_keypairs[i],
                         &vote_keypairs[i],
                         None,
-                    );
+                    )
                 })
                 .collect_vec();
             let txs = (0..100_usize)

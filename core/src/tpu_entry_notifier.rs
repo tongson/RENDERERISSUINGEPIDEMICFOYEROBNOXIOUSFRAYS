@@ -66,19 +66,13 @@ impl TpuEntryNotifier {
             entries_ticks,
         } = entry_receiver.recv_timeout(Duration::from_secs(1))?;
         let slot = bank.slot();
-        let mut indices_sent = vec![];
+        if slot != *current_slot {
+            *current_index = 0;
+            *current_transaction_index = 0;
+            *current_slot = slot;
+        }
 
-        entries_ticks.iter().for_each(|(entry, _)| {
-            let index = if slot != *current_slot {
-                *current_index = 0;
-                *current_transaction_index = 0;
-                *current_slot = slot;
-                0
-            } else {
-                *current_index += 1;
-                *current_index
-            };
-
+        for (entry, _ticks) in &entries_ticks {
             let entry_summary = EntrySummary {
                 num_hashes: entry.num_hashes,
                 hash: entry.hash,
@@ -86,32 +80,31 @@ impl TpuEntryNotifier {
             };
             if let Err(err) = entry_notification_sender.send(EntryNotification {
                 slot,
-                index,
+                index: *current_index,
                 entry: entry_summary,
-                starting_transaction_index: *current_transaction_index
+                starting_transaction_index: *current_transaction_index,
             }) {
                 warn!(
-                "Failed to send slot {slot:?} entry {index:?} from Tpu to EntryNotifierService, error {err:?}",
+                "Failed to send slot {slot:?} entry {current_index:?} from Tpu to EntryNotifierService, \
+                 error {err:?}",
             );
             }
-
             *current_transaction_index += entry.transactions.len();
-
-            indices_sent.push(index);
-        });
+            *current_index += 1;
+        }
 
         if let Err(err) = broadcast_entry_sender.send(WorkingBankEntry {
             bank,
             entries_ticks,
         }) {
             warn!(
-                "Failed to send slot {slot:?} entries {indices_sent:?} from Tpu to BroadcastStage, error {err:?}",
+                "Failed to send slot {slot:?} entry {current_index:?} from Tpu to BroadcastStage, error \
+                 {err:?}",
             );
             // If the BroadcastStage channel is closed, the validator has halted. Try to exit
             // gracefully.
             exit.store(true, Ordering::Relaxed);
         }
-
         Ok(())
     }
 

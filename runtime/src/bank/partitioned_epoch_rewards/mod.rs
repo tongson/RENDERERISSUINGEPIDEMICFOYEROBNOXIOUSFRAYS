@@ -10,10 +10,10 @@ use {
     solana_accounts_db::{
         partitioned_rewards::PartitionedEpochRewardsConfig, stake_rewards::StakeReward,
     },
+    solana_feature_set as feature_set,
     solana_sdk::{
         account::AccountSharedData,
         account_utils::StateMut,
-        feature_set,
         pubkey::Pubkey,
         reward_info::RewardInfo,
         stake::state::{Delegation, Stake, StakeStateV2},
@@ -27,7 +27,6 @@ use {
 /// Distributing rewards to stake accounts begins AFTER this many blocks.
 const REWARD_CALCULATION_NUM_BLOCKS: u64 = 1;
 
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub(crate) struct PartitionedStakeReward {
     /// Stake account address
@@ -56,7 +55,6 @@ impl PartitionedStakeReward {
 
 type PartitionedStakeRewards = Vec<PartitionedStakeReward>;
 
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StartBlockHeightAndRewards {
     /// the block height of the slot at which rewards distribution began
@@ -66,7 +64,6 @@ pub(crate) struct StartBlockHeightAndRewards {
 }
 
 /// Represent whether bank is in the reward phase or not.
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample, AbiEnumVisitor))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub(crate) enum EpochRewardStatus {
     /// this bank is in the reward phase.
@@ -285,10 +282,7 @@ mod tests {
         },
         assert_matches::assert_matches,
         solana_accounts_db::{
-            accounts_db::{
-                AccountShrinkThreshold, AccountsDbConfig, ACCOUNTS_DB_CONFIG_FOR_TESTING,
-            },
-            accounts_index::AccountSecondaryIndexes,
+            accounts_db::{AccountsDbConfig, ACCOUNTS_DB_CONFIG_FOR_TESTING},
             partitioned_rewards::TestPartitionedEpochRewards,
         },
         solana_sdk::{
@@ -303,7 +297,10 @@ mod tests {
             transaction::Transaction,
             vote::state::{VoteStateVersions, MAX_LOCKOUT_HISTORY},
         },
-        solana_vote_program::{vote_state, vote_transaction},
+        solana_vote_program::{
+            vote_state::{self, TowerSync},
+            vote_transaction,
+        },
     };
 
     impl PartitionedStakeReward {
@@ -398,13 +395,13 @@ mod tests {
             Vec::new(),
             None,
             None,
-            AccountSecondaryIndexes::default(),
-            AccountShrinkThreshold::default(),
             false,
             Some(accounts_db_config),
             None,
             Some(Pubkey::new_unique()),
             Arc::default(),
+            None,
+            None,
         );
 
         // Fill bank_forks with banks with votes landing in the next slot
@@ -505,13 +502,13 @@ mod tests {
             Vec::new(),
             None,
             None,
-            AccountSecondaryIndexes::default(),
-            AccountShrinkThreshold::default(),
             false,
             Some(accounts_db_config),
             None,
             Some(Pubkey::new_unique()),
             Arc::default(),
+            None,
+            None,
         );
 
         let stake_account_stores_per_block =
@@ -796,9 +793,9 @@ mod tests {
 
             // Fill bank_forks with banks with votes landing in the next slot
             // So that rewards will be paid out at the epoch boundary, i.e. slot = 32
-            let vote = vote_transaction::new_vote_transaction(
-                vec![slot - 1],
-                previous_bank.hash(),
+            let tower_sync = TowerSync::new_from_slot(slot - 1, previous_bank.hash());
+            let vote = vote_transaction::new_tower_sync_transaction(
+                tower_sync,
                 previous_bank.last_blockhash(),
                 &validator_vote_keypairs.node_keypair,
                 &validator_vote_keypairs.vote_keypair,

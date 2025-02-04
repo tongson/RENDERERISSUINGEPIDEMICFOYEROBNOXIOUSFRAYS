@@ -29,20 +29,23 @@
 
 #![allow(clippy::arithmetic_side_effects)]
 
-use crate::{
-    account_info::AccountInfo,
-    instruction::{AccountMeta, Instruction},
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    sanitize::SanitizeError,
-    serialize_utils::{read_pubkey, read_slice, read_u16, read_u8},
-};
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 #[cfg(not(target_os = "solana"))]
 use {
     crate::serialize_utils::{append_slice, append_u16, append_u8},
     bitflags::bitflags,
+};
+use {
+    crate::{
+        account_info::AccountInfo,
+        instruction::{AccountMeta, Instruction},
+        program_error::ProgramError,
+        pubkey::Pubkey,
+        serialize_utils::{read_pubkey, read_slice, read_u16, read_u8},
+    },
+    solana_sanitize::SanitizeError,
+    solana_sysvar_id::declare_sysvar_id,
 };
 
 /// Instructions sysvar, dummy type.
@@ -57,7 +60,7 @@ use {
 /// Use the free functions in this module to access the instructions sysvar.
 pub struct Instructions();
 
-crate::declare_sysvar_id!("Sysvar1nstructions1111111111111111111111111", Instructions);
+declare_sysvar_id!("Sysvar1nstructions1111111111111111111111111", Instructions);
 
 /// Construct the account data for the instructions sysvar.
 ///

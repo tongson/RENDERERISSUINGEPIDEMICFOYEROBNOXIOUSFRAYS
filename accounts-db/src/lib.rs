@@ -1,10 +1,11 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 
 #[macro_use]
 extern crate lazy_static;
 
 pub mod account_info;
+pub mod account_locks;
 pub mod account_storage;
 pub mod accounts;
 mod accounts_cache;
@@ -30,7 +31,7 @@ pub mod epoch_accounts_hash;
 mod file_io;
 pub mod hardened_unpack;
 pub mod partitioned_rewards;
-mod pubkey_bins;
+pub mod pubkey_bins;
 mod read_only_accounts_cache;
 mod rolling_bit_field;
 pub mod secondary_index;
@@ -46,7 +47,10 @@ pub mod waitable_condvar;
 // the accounts-hash-cache-tool needs access to these types
 pub use {
     accounts_hash::CalculateHashIntermediate as CacheHashDataFileEntry,
-    cache_hash_data::Header as CacheHashDataFileHeader,
+    cache_hash_data::{
+        parse_filename as parse_cache_hash_data_filename, Header as CacheHashDataFileHeader,
+        ParsedFilename as ParsedCacheHashDataFilename,
+    },
 };
 
 #[macro_use]

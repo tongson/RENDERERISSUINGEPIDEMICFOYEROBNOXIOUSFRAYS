@@ -1,0 +1,19 @@
+[package]
+name = "funnel-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license.workspace = true
+
+[features]
+bpf-entrypoint = []
+
+[dependencies]
+
+[dev-dependencies]
+arrayref = { workspace = true }
+bytemuck = { workspace = true }
+expect-test = { workspace = true }
+funnel = { workspace = true }
+solana-sdk = { workspace = true }
+svm-test = { workspace = true }

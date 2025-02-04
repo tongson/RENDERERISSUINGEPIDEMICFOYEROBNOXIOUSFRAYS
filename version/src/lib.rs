@@ -1,10 +1,11 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 
 extern crate serde_derive;
 pub use self::legacy::{LegacyVersion1, LegacyVersion2};
 use {
     serde_derive::{Deserialize, Serialize},
-    solana_sdk::{sanitize::Sanitize, serde_varint},
+    solana_sanitize::Sanitize,
+    solana_serde_varint as serde_varint,
     std::{convert::TryInto, fmt},
 };
 #[cfg_attr(feature = "frozen-abi", macro_use)]
@@ -19,6 +20,7 @@ enum ClientId {
     JitoLabs,
     Firedancer,
     Agave,
+    Paladin,
     // If new variants are added, update From<u16> and TryFrom<ClientId>.
     Unknown(u16),
 }
@@ -67,11 +69,8 @@ impl From<LegacyVersion2> for Version {
 
 impl Default for Version {
     fn default() -> Self {
-        let feature_set = u32::from_le_bytes(
-            solana_sdk::feature_set::ID.as_ref()[..4]
-                .try_into()
-                .unwrap(),
-        );
+        let feature_set =
+            u32::from_le_bytes(solana_feature_set::ID.as_ref()[..4].try_into().unwrap());
         Self {
             major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
             minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
@@ -79,7 +78,7 @@ impl Default for Version {
             commit: compute_commit(option_env!("CI_COMMIT")).unwrap_or_default(),
             feature_set,
             // Other client implementations need to modify this line.
-            client: u16::try_from(ClientId::JitoLabs).unwrap(),
+            client: u16::try_from(ClientId::Paladin).unwrap(),
         }
     }
 }
@@ -114,6 +113,7 @@ impl From<u16> for ClientId {
             1u16 => Self::JitoLabs,
             2u16 => Self::Firedancer,
             3u16 => Self::Agave,
+            4u16 => Self::Paladin,
             _ => Self::Unknown(client),
         }
     }
@@ -128,6 +128,7 @@ impl TryFrom<ClientId> for u16 {
             ClientId::JitoLabs => Ok(1u16),
             ClientId::Firedancer => Ok(2u16),
             ClientId::Agave => Ok(3u16),
+            ClientId::Paladin => Ok(4u16),
             ClientId::Unknown(client @ 0u16..=3u16) => Err(format!("Invalid client: {client}")),
             ClientId::Unknown(client) => Ok(client),
         }

@@ -45,7 +45,7 @@ If a pre-built binary is not available for a given platform, building the instal
 
 ```bash
 $ git clone https://github.com/jito-foundation/jito-solana.git
-$ cd solana/install
+$ cd jito-solana/install
 $ cargo run -- --help
 ```
 

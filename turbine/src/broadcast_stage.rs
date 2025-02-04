@@ -20,7 +20,7 @@ use {
     solana_measure::measure::Measure,
     solana_metrics::{inc_new_counter_error, inc_new_counter_info},
     solana_poh::poh_recorder::WorkingBankEntry,
-    solana_runtime::bank_forks::BankForks,
+    solana_runtime::{bank::MAX_LEADER_SCHEDULE_STAKES, bank_forks::BankForks},
     solana_sdk::{
         clock::Slot,
         pubkey::Pubkey,
@@ -31,6 +31,7 @@ use {
         sendmmsg::{batch_send, SendPktsError},
         socket::SocketAddrSpace,
     },
+    static_assertions::const_assert_eq,
     std::{
         collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
@@ -52,7 +53,8 @@ pub(crate) mod broadcast_utils;
 mod fail_entry_verification_broadcast_run;
 mod standard_broadcast_run;
 
-const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = 8;
+const_assert_eq!(CLUSTER_NODES_CACHE_NUM_EPOCH_CAP, 5);
+const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = MAX_LEADER_SCHEDULE_STAKES as usize;
 const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
 
 pub(crate) type RecordReceiver = Receiver<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>;
@@ -269,6 +271,7 @@ impl BroadcastStage {
     /// * `window` - Cache of Shreds that we have broadcast
     /// * `receiver` - Receive channel for Shreds to be retransmitted to all the layer 1 nodes.
     /// * `exit_sender` - Set to true when this service exits, allows rest of Tpu to exit cleanly.
+    ///
     /// Otherwise, when a Tpu closes, it only closes the stages that come after it. The stages
     /// that come before could be blocked on a receive, and never notice that they need to
     /// exit. Now, if any stage of the Tpu closes, it will lead to closing the WriteStage (b/c

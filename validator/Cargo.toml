@@ -56,7 +56,7 @@ solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-runtime = { workspace = true }
 solana-runtime-plugin = { workspace = true }
-solana-sdk = { workspace = true }
+solana-sdk = { workspace = true, features = ["openssl-vendored"] }
 solana-send-transaction-service = { workspace = true }
 solana-storage-bigtable = { workspace = true }
 solana-streamer = { workspace = true }
@@ -71,10 +71,13 @@ tokio = { workspace = true }
 tonic = { workspace = true, features = ["tls", "tls-roots", "tls-webpki-roots"] }
 
 [dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-inline-spl = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
+tempfile = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = { workspace = true }

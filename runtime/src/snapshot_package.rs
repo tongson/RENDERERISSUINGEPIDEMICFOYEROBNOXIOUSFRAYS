@@ -8,7 +8,7 @@ use {
     solana_accounts_db::{
         account_storage::meta::StoredMetaWriteVersion,
         accounts::Accounts,
-        accounts_db::{AccountStorageEntry, BankHashStats},
+        accounts_db::{stats::BankHashStats, AccountStorageEntry},
         accounts_hash::{AccountsDeltaHash, AccountsHash, AccountsHashKind},
         epoch_accounts_hash::EpochAccountsHash,
     },
@@ -80,9 +80,10 @@ impl AccountsPackage {
             let accounts_delta_hash = accounts_db.get_accounts_delta_hash(slot).unwrap();
             // SAFETY: Every slot *must* have a BankHashStats entry in AccountsDb.
             let bank_hash_stats = accounts_db.get_bank_hash_stats(slot).unwrap();
+            let bank_fields_to_serialize = bank.get_fields_to_serialize();
             SupplementalSnapshotInfo {
                 status_cache_slot_deltas,
-                bank_fields_to_serialize: bank.get_fields_to_serialize(),
+                bank_fields_to_serialize,
                 bank_hash_stats,
                 accounts_delta_hash,
                 epoch_accounts_hash: bank.get_epoch_accounts_hash_to_serialize(),

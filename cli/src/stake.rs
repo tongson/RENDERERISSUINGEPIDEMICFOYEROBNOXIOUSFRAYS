@@ -5,15 +5,17 @@ use {
             log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
             ProcessResult,
         },
-        compute_budget::WithComputeUnitPrice,
+        compute_budget::{
+            simulate_and_update_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         feature::get_feature_activation_epoch,
         memo::WithMemo,
         nonce::check_nonce_account,
         spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
     },
-    clap::{value_t, App, Arg, ArgGroup, ArgMatches, SubCommand},
+    clap::{value_t, App, AppSettings, Arg, ArgGroup, ArgMatches, SubCommand},
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         fee_payer::{fee_payer_arg, FEE_PAYER_ARG},
         hidden_unless_forced,
         input_parsers::*,
@@ -43,7 +45,6 @@ use {
         clock::{Clock, UnixTimestamp, SECONDS_PER_DAY},
         commitment_config::CommitmentConfig,
         epoch_schedule::EpochSchedule,
-        feature_set,
         message::Message,
         native_token::Sol,
         pubkey::Pubkey,
@@ -328,49 +329,13 @@ impl StakeSubCommands for App<'_, '_> {
         )
         .subcommand(
             SubCommand::with_name("redelegate-stake")
-                .about("Redelegate active stake to another vote account")
+                .setting(AppSettings::Hidden)
                 .arg(
-                    Arg::with_name("force")
-                        .long("force")
-                        .takes_value(false)
-                        .hidden(hidden_unless_forced()) // Don't document this argument to discourage its use
-                        .help("Override vote account sanity checks (use carefully!)"),
-                )
-                .arg(pubkey!(
-                    Arg::with_name("stake_account_pubkey")
-                        .index(1)
-                        .value_name("STAKE_ACCOUNT_ADDRESS")
-                        .required(true),
-                    "Existing delegated stake account that has been fully activated. On success \
-                     this stake account will be scheduled for deactivation and the rent-exempt \
-                     balance may be withdrawn once fully deactivated."
-                ))
-                .arg(pubkey!(
-                    Arg::with_name("vote_account_pubkey")
-                        .index(2)
-                        .value_name("REDELEGATED_VOTE_ACCOUNT_ADDRESS")
-                        .required(true),
-                    "Vote account to which the stake will be redelegated."
-                ))
-                .arg(
-                    Arg::with_name("redelegation_stake_account")
-                        .index(3)
-                        .value_name("REDELEGATION_STAKE_ACCOUNT")
-                        .takes_value(true)
-                        .required(true)
-                        .validator(is_valid_signer)
-                        .help(
-                            "Stake account to create for the redelegation. On success this stake \
-                             account will be created and scheduled for activation with all the \
-                             stake in the existing stake account, exclusive of the rent-exempt \
-                             balance retained in the existing account",
-                        ),
-                )
-                .arg(stake_authority_arg())
-                .offline_args()
-                .nonce_args(false)
-                .arg(fee_payer_arg())
-                .arg(memo_arg()),
+                    // Consume all positional arguments
+                    Arg::with_name("arg")
+                        .multiple(true)
+                        .hidden(hidden_unless_forced()),
+                ),
         )
         .subcommand(
             SubCommand::with_name("stake-authorize")
@@ -777,6 +742,14 @@ impl StakeSubCommands for App<'_, '_> {
                         .help("Format stake rewards data in csv"),
                 )
                 .arg(
+                    Arg::with_name("starting_epoch")
+                        .long("starting-epoch")
+                        .takes_value(true)
+                        .value_name("NUM")
+                        .requires("with_rewards")
+                        .help("Start displaying from epoch NUM"),
+                )
+                .arg(
                     Arg::with_name("num_rewards_epochs")
                         .long("num-rewards-epochs")
                         .takes_value(true)
@@ -911,8 +884,6 @@ pub fn parse_stake_delegate_stake(
         pubkey_of_signer(matches, "stake_account_pubkey", wallet_manager)?.unwrap();
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
-    let (redelegation_stake_account, redelegation_stake_account_pubkey) =
-        signer_of(matches, "redelegation_stake_account", wallet_manager)?;
     let force = matches.is_present("force");
     let sign_only = matches.is_present(SIGN_ONLY_ARG.name);
     let dump_transaction_message = matches.is_present(DUMP_TRANSACTION_MESSAGE.name);
@@ -928,9 +899,6 @@ pub fn parse_stake_delegate_stake(
     let mut bulk_signers = vec![stake_authority, fee_payer];
     if nonce_account.is_some() {
         bulk_signers.push(nonce_authority);
-    }
-    if redelegation_stake_account.is_some() {
-        bulk_signers.push(redelegation_stake_account);
     }
     let signer_info =
         default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
@@ -949,8 +917,6 @@ pub fn parse_stake_delegate_stake(
             nonce_authority: signer_info.index_of(nonce_authority_pubkey).unwrap(),
             memo,
             fee_payer: signer_info.index_of(fee_payer_pubkey).unwrap(),
-            redelegation_stake_account: redelegation_stake_account_pubkey
-                .and_then(|_| signer_info.index_of(redelegation_stake_account_pubkey)),
             compute_unit_price,
         },
         signers: signer_info.signers,
@@ -1371,12 +1337,14 @@ pub fn parse_show_stake_account(
     } else {
         None
     };
+    let starting_epoch = value_of(matches, "starting_epoch");
     Ok(CliCommandInfo::without_signers(
         CliCommand::ShowStakeAccount {
             pubkey: stake_account_pubkey,
             use_lamports_unit,
             with_rewards,
             use_csv,
+            starting_epoch,
         },
     ))
 }
@@ -1411,7 +1379,7 @@ pub fn process_create_stake_account(
     withdrawer: &Option<Pubkey>,
     withdrawer_signer: Option<SignerIndex>,
     lockup: &Lockup,
-    amount: SpendAmount,
+    mut amount: SpendAmount,
     sign_only: bool,
     dump_transaction_message: bool,
     blockhash_query: &BlockhashQuery,
@@ -1420,7 +1388,7 @@ pub fn process_create_stake_account(
     memo: Option<&String>,
     fee_payer: SignerIndex,
     from: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let stake_account = config.signers[stake_account];
     let stake_account_address = if let Some(seed) = seed {
@@ -1437,6 +1405,10 @@ pub fn process_create_stake_account(
     let fee_payer = config.signers[fee_payer];
     let nonce_authority = config.signers[nonce_authority];
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let build_message = |lamports| {
         let authorized = Authorized {
             staker: staker.unwrap_or(from.pubkey()),
@@ -1478,7 +1450,10 @@ pub fn process_create_stake_account(
             ),
         }
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
         if let Some(nonce_account) = &nonce_account {
             Message::new_with_nonce(
                 ixs,
@@ -1493,6 +1468,14 @@ pub fn process_create_stake_account(
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
+    if !sign_only && amount == SpendAmount::All {
+        let minimum_balance =
+            rpc_client.get_minimum_balance_for_rent_exemption(StakeStateV2::size_of())?;
+        amount = SpendAmount::AllForAccountCreation {
+            create_account_min_balance: minimum_balance,
+        };
+    }
+
     let (message, lamports) = resolve_spend_tx_and_check_account_balances(
         rpc_client,
         sign_only,
@@ -1500,6 +1483,7 @@ pub fn process_create_stake_account(
         &recent_blockhash,
         &from.pubkey(),
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -1516,7 +1500,6 @@ pub fn process_create_stake_account(
 
         let minimum_balance =
             rpc_client.get_minimum_balance_for_rent_exemption(StakeStateV2::size_of())?;
-
         if lamports < minimum_balance {
             return Err(CliError::BadParameter(format!(
                 "need at least {minimum_balance} lamports for stake account to be rent exempt, \
@@ -1567,7 +1550,7 @@ pub fn process_stake_authorize(
     memo: Option<&String>,
     fee_payer: SignerIndex,
     no_wait: bool,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let mut ixs = Vec::new();
     let custodian = custodian.map(|index| config.signers[index]);
@@ -1633,16 +1616,23 @@ pub fn process_stake_authorize(
             ));
         }
     }
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     ixs = ixs
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1652,6 +1642,7 @@ pub fn process_stake_authorize(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -1703,7 +1694,7 @@ pub fn process_deactivate_stake_account(
     memo: Option<&String>,
     seed: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
@@ -1713,6 +1704,10 @@ pub fn process_deactivate_stake_account(
         *stake_account_pubkey
     };
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![if deactivate_delinquent {
         let stake_account = rpc_client.get_account(&stake_account_address)?;
         if stake_account.owner != stake::program::id() {
@@ -1780,12 +1775,15 @@ pub fn process_deactivate_stake_account(
         stake_instruction::deactivate_stake(&stake_account_address, &stake_authority.pubkey())
     }]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
 
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1795,6 +1793,7 @@ pub fn process_deactivate_stake_account(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -1844,7 +1843,7 @@ pub fn process_withdraw_stake(
     memo: Option<&String>,
     seed: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let withdraw_authority = config.signers[withdraw_authority];
     let custodian = custodian.map(|index| config.signers[index]);
@@ -1860,6 +1859,10 @@ pub fn process_withdraw_stake(
     let fee_payer = config.signers[fee_payer];
     let nonce_authority = config.signers[nonce_authority];
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let build_message = |lamports| {
         let ixs = vec![stake_instruction::withdraw(
             &stake_account_address,
@@ -1869,7 +1872,10 @@ pub fn process_withdraw_stake(
             custodian.map(|signer| signer.pubkey()).as_ref(),
         )]
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
         if let Some(nonce_account) = &nonce_account {
             Message::new_with_nonce(
@@ -1890,6 +1896,7 @@ pub fn process_withdraw_stake(
         &recent_blockhash,
         &stake_account_address,
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -1942,7 +1949,7 @@ pub fn process_split_stake(
     split_stake_account_seed: &Option<String>,
     lamports: u64,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
     rent_exempt_reserve: Option<&u64>,
 ) -> ProcessResult {
     let split_stake_account = config.signers[split_stake_account];
@@ -2037,6 +2044,10 @@ pub fn process_split_stake(
             rent_exempt_reserve,
         ));
     }
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     if let Some(seed) = split_stake_account_seed {
         ixs.append(
             &mut stake_instruction::split_with_seed(
@@ -2048,7 +2059,10 @@ pub fn process_split_stake(
                 seed,
             )
             .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price),
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            }),
         )
     } else {
         ixs.append(
@@ -2059,13 +2073,16 @@ pub fn process_split_stake(
                 &split_stake_account_address,
             )
             .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price),
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            }),
         )
     };
 
     let nonce_authority = config.signers[nonce_authority];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -2075,6 +2092,7 @@ pub fn process_split_stake(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -2121,7 +2139,7 @@ pub fn process_merge_stake(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let fee_payer = config.signers[fee_payer];
 
@@ -2161,17 +2179,24 @@ pub fn process_merge_stake(
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = stake_instruction::merge(
         stake_account_pubkey,
         source_stake_account_pubkey,
         &stake_authority.pubkey(),
     )
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
 
     let nonce_authority = config.signers[nonce_authority];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -2181,6 +2206,7 @@ pub fn process_merge_stake(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -2232,18 +2258,25 @@ pub fn process_stake_set_lockup(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
     let custodian = config.signers[custodian];
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![if new_custodian_signer.is_some() {
         stake_instruction::set_lockup_checked(stake_account_pubkey, lockup, &custodian.pubkey())
     } else {
         stake_instruction::set_lockup(stake_account_pubkey, lockup, &custodian.pubkey())
     }]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
@@ -2266,7 +2299,7 @@ pub fn process_stake_set_lockup(
         }
     }
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -2276,6 +2309,7 @@ pub fn process_stake_set_lockup(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -2517,10 +2551,18 @@ pub(crate) fn fetch_epoch_rewards(
     rpc_client: &RpcClient,
     address: &Pubkey,
     mut num_epochs: usize,
+    starting_epoch: Option<u64>,
 ) -> Result<Vec<CliEpochReward>, Box<dyn std::error::Error>> {
     let mut all_epoch_rewards = vec![];
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
-    let mut rewards_epoch = rpc_client.get_epoch_info()?.epoch;
+    let mut rewards_epoch = if let Some(epoch) = starting_epoch {
+        epoch
+    } else {
+        rpc_client
+            .get_epoch_info()?
+            .epoch
+            .saturating_sub(num_epochs as u64)
+    };
 
     let mut process_reward =
         |reward: &Option<RpcInflationReward>| -> Result<(), Box<dyn std::error::Error>> {
@@ -2535,14 +2577,14 @@ pub(crate) fn fetch_epoch_rewards(
             Ok(())
         };
 
-    while num_epochs > 0 && rewards_epoch > 0 {
-        rewards_epoch = rewards_epoch.saturating_sub(1);
+    while num_epochs > 0 {
         if let Ok(rewards) = rpc_client.get_inflation_reward(&[*address], Some(rewards_epoch)) {
             process_reward(&rewards[0])?;
         } else {
             eprintln!("Rewards not available for epoch {rewards_epoch}");
         }
         num_epochs = num_epochs.saturating_sub(1);
+        rewards_epoch = rewards_epoch.saturating_add(1);
     }
 
     Ok(all_epoch_rewards)
@@ -2555,6 +2597,7 @@ pub fn process_show_stake_account(
     use_lamports_unit: bool,
     with_rewards: Option<usize>,
     use_csv: bool,
+    starting_epoch: Option<u64>,
 ) -> ProcessResult {
     let stake_account = rpc_client.get_account(stake_account_address)?;
     if stake_account.owner != stake::program::id() {
@@ -2575,7 +2618,7 @@ pub fn process_show_stake_account(
             })?;
             let new_rate_activation_epoch = get_feature_activation_epoch(
                 rpc_client,
-                &feature_set::reduce_stake_warmup_cooldown::id(),
+                &solana_feature_set::reduce_stake_warmup_cooldown::id(),
             )?;
 
             let mut state = build_stake_state(
@@ -2590,7 +2633,12 @@ pub fn process_show_stake_account(
 
             if state.stake_type == CliStakeType::Stake && state.activation_epoch.is_some() {
                 let epoch_rewards = with_rewards.and_then(|num_epochs| {
-                    match fetch_epoch_rewards(rpc_client, stake_account_address, num_epochs) {
+                    match fetch_epoch_rewards(
+                        rpc_client,
+                        stake_account_address,
+                        num_epochs,
+                        starting_epoch,
+                    ) {
                         Ok(rewards) => Some(rewards),
                         Err(error) => {
                             eprintln!("Failed to fetch epoch rewards: {error:?}");
@@ -2657,30 +2705,12 @@ pub fn process_delegate_stake(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    redelegation_stake_account: Option<SignerIndex>,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     check_unique_pubkeys(
         (&config.signers[0].pubkey(), "cli keypair".to_string()),
         (stake_account_pubkey, "stake_account_pubkey".to_string()),
     )?;
-    let redelegation_stake_account = redelegation_stake_account.map(|index| config.signers[index]);
-    if let Some(redelegation_stake_account) = &redelegation_stake_account {
-        check_unique_pubkeys(
-            (stake_account_pubkey, "stake_account_pubkey".to_string()),
-            (
-                &redelegation_stake_account.pubkey(),
-                "redelegation_stake_account".to_string(),
-            ),
-        )?;
-        check_unique_pubkeys(
-            (&config.signers[0].pubkey(), "cli keypair".to_string()),
-            (
-                &redelegation_stake_account.pubkey(),
-                "redelegation_stake_account".to_string(),
-            ),
-        )?;
-    }
     let stake_authority = config.signers[stake_authority];
 
     if !sign_only {
@@ -2734,27 +2764,25 @@ pub fn process_delegate_stake(
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
-    let ixs = if let Some(redelegation_stake_account) = &redelegation_stake_account {
-        stake_instruction::redelegate(
-            stake_account_pubkey,
-            &stake_authority.pubkey(),
-            vote_account_pubkey,
-            &redelegation_stake_account.pubkey(),
-        )
-    } else {
-        vec![stake_instruction::delegate_stake(
-            stake_account_pubkey,
-            &stake_authority.pubkey(),
-            vote_account_pubkey,
-        )]
-    }
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
+    let ixs = vec![stake_instruction::delegate_stake(
+        stake_account_pubkey,
+        &stake_authority.pubkey(),
+        vote_account_pubkey,
+    )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
 
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -2764,6 +2792,7 @@ pub fn process_delegate_stake(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -4146,7 +4175,6 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
@@ -4179,7 +4207,6 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![
@@ -4212,7 +4239,6 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
@@ -4248,7 +4274,6 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
@@ -4279,7 +4304,6 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
@@ -4320,7 +4344,6 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 1,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![
@@ -4370,7 +4393,6 @@ mod tests {
                     nonce_authority: 2,
                     memo: None,
                     fee_payer: 1,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![
@@ -4408,55 +4430,11 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 1,
-                    redelegation_stake_account: None,
                     compute_unit_price: None,
                 },
                 signers: vec![
                     Box::new(read_keypair_file(&default_keypair_file).unwrap()),
                     Box::new(read_keypair_file(&fee_payer_keypair_file).unwrap())
-                ],
-            }
-        );
-
-        // Test RedelegateStake Subcommand (minimal test due to the significant implementation
-        // overlap with DelegateStake)
-        let (redelegation_stake_account_keypair_file, mut redelegation_stake_account_tmp_file) =
-            make_tmp_file();
-        let redelegation_stake_account_keypair = Keypair::new();
-        write_keypair(
-            &redelegation_stake_account_keypair,
-            redelegation_stake_account_tmp_file.as_file_mut(),
-        )
-        .unwrap();
-
-        let test_redelegate_stake = test_commands.clone().get_matches_from(vec![
-            "test",
-            "redelegate-stake",
-            &stake_account_string,
-            &vote_account_string,
-            &redelegation_stake_account_keypair_file,
-        ]);
-        assert_eq!(
-            parse_command(&test_redelegate_stake, &default_signer, &mut None).unwrap(),
-            CliCommandInfo {
-                command: CliCommand::DelegateStake {
-                    stake_account_pubkey,
-                    vote_account_pubkey,
-                    stake_authority: 0,
-                    force: false,
-                    sign_only: false,
-                    dump_transaction_message: false,
-                    blockhash_query: BlockhashQuery::default(),
-                    nonce_account: None,
-                    nonce_authority: 0,
-                    memo: None,
-                    fee_payer: 0,
-                    redelegation_stake_account: Some(1),
-                    compute_unit_price: None,
-                },
-                signers: vec![
-                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
-                    Box::new(read_keypair_file(&redelegation_stake_account_keypair_file).unwrap())
                 ],
             }
         );

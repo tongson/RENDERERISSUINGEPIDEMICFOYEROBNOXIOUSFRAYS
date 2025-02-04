@@ -9,17 +9,17 @@
 
 #[cfg(feature = "sbf_rust")]
 use {
+    borsh::{from_slice, to_vec, BorshDeserialize, BorshSerialize},
     itertools::izip,
     solana_account_decoder::parse_bpf_loader::{
         parse_bpf_upgradeable_loader, BpfUpgradeableLoaderAccountType,
     },
-    solana_compute_budget::{
-        compute_budget::ComputeBudget,
-        compute_budget_processor::process_compute_budget_instructions,
-    },
+    solana_compute_budget::compute_budget::ComputeBudget,
+    solana_feature_set::{self as feature_set, FeatureSet},
     solana_ledger::token_balances::collect_token_balances,
-    solana_program_runtime::{invoke_context::mock_process_instruction, timings::ExecuteTimings},
-    solana_rbpf::vm::ContextObject,
+    solana_program_runtime::{
+        invoke_context::mock_process_instruction, solana_rbpf::vm::ContextObject,
+    },
     solana_runtime::{
         bank::{Bank, TransactionBalancesSet},
         bank_client::BankClient,
@@ -34,6 +34,7 @@ use {
             load_upgradeable_program_wrapper, set_upgrade_authority, upgrade_program,
         },
     },
+    solana_runtime_transaction::instructions_processor::process_compute_budget_instructions,
     solana_sbf_rust_invoke_dep::*,
     solana_sbf_rust_realloc_dep::*,
     solana_sbf_rust_realloc_invoke_dep::*,
@@ -45,8 +46,7 @@ use {
         clock::{UnixTimestamp, MAX_PROCESSING_AGE},
         compute_budget::ComputeBudgetInstruction,
         entrypoint::MAX_PERMITTED_DATA_INCREASE,
-        feature_set::{self, FeatureSet},
-        fee::FeeStructure,
+        fee::{FeeBudgetLimits, FeeStructure},
         fee_calculator::FeeRateGovernor,
         genesis_config::ClusterType,
         hash::Hash,
@@ -63,16 +63,17 @@ use {
         transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
     },
     solana_svm::{
+        transaction_commit_result::{CommittedTransaction, TransactionCommitResult},
+        transaction_execution_result::InnerInstruction,
         transaction_processor::ExecutionRecordingConfig,
-        transaction_results::{
-            InnerInstruction, TransactionExecutionDetails, TransactionExecutionResult,
-            TransactionResults,
-        },
     },
+    solana_svm_transaction::svm_message::SVMMessage,
+    solana_timings::ExecuteTimings,
     solana_transaction_status::{
         map_inner_instructions, ConfirmedTransactionWithStatusMeta, TransactionStatusMeta,
         TransactionWithStatusMeta, VersionedTransactionWithStatusMeta,
     },
+    solana_type_overrides::rand,
     std::{
         assert_eq,
         cell::RefCell,
@@ -91,11 +92,26 @@ fn process_transaction_and_record_inner(
     Result<(), TransactionError>,
     Vec<Vec<InnerInstruction>>,
     Vec<String>,
+    u64,
 ) {
-    let signature = tx.signatures.first().unwrap().clone();
+    let commit_result = load_execute_and_commit_transaction(bank, tx);
+    let CommittedTransaction {
+        inner_instructions,
+        log_messages,
+        status,
+        executed_units,
+        ..
+    } = commit_result.unwrap();
+    let inner_instructions = inner_instructions.expect("cpi recording should be enabled");
+    let log_messages = log_messages.expect("log recording should be enabled");
+    (status, inner_instructions, log_messages, executed_units)
+}
+
+#[cfg(feature = "sbf_rust")]
+fn load_execute_and_commit_transaction(bank: &Bank, tx: Transaction) -> TransactionCommitResult {
     let txs = vec![tx];
     let tx_batch = bank.prepare_batch_for_tests(txs);
-    let mut results = bank
+    let mut commit_results = bank
         .load_execute_and_commit_transactions(
             &tx_batch,
             MAX_PROCESSING_AGE,
@@ -109,23 +125,7 @@ fn process_transaction_and_record_inner(
             None,
         )
         .0;
-    let result = results
-        .fee_collection_results
-        .swap_remove(0)
-        .and_then(|_| bank.get_signature_status(&signature).unwrap());
-    let execution_details = results
-        .execution_results
-        .swap_remove(0)
-        .details()
-        .expect("tx should be executed")
-        .clone();
-    let inner_instructions = execution_details
-        .inner_instructions
-        .expect("cpi recording should be enabled");
-    let log_messages = execution_details
-        .log_messages
-        .expect("log recording should be enabled");
-    (result, inner_instructions, log_messages)
+    commit_results.pop().unwrap()
 }
 
 #[cfg(feature = "sbf_rust")]
@@ -138,9 +138,7 @@ fn execute_transactions(
     let mut mint_decimals = HashMap::new();
     let tx_pre_token_balances = collect_token_balances(&bank, &batch, &mut mint_decimals, None);
     let (
-        TransactionResults {
-            execution_results, ..
-        },
+        commit_results,
         TransactionBalancesSet {
             pre_balances,
             post_balances,
@@ -158,7 +156,7 @@ fn execute_transactions(
 
     izip!(
         txs.iter(),
-        execution_results.into_iter(),
+        commit_results.into_iter(),
         pre_balances.into_iter(),
         post_balances.into_iter(),
         tx_pre_token_balances.into_iter(),
@@ -167,56 +165,52 @@ fn execute_transactions(
     .map(
         |(
             tx,
-            execution_result,
+            commit_result,
             pre_balances,
             post_balances,
             pre_token_balances,
             post_token_balances,
         )| {
-            match execution_result {
-                TransactionExecutionResult::Executed { details, .. } => {
-                    let TransactionExecutionDetails {
-                        status,
-                        log_messages,
-                        inner_instructions,
-                        fee_details,
-                        return_data,
-                        executed_units,
-                        ..
-                    } = details;
+            commit_result.map(|committed_tx| {
+                let CommittedTransaction {
+                    status,
+                    log_messages,
+                    inner_instructions,
+                    return_data,
+                    executed_units,
+                    fee_details,
+                    ..
+                } = committed_tx;
 
-                    let inner_instructions = inner_instructions.map(|inner_instructions| {
-                        map_inner_instructions(inner_instructions).collect()
-                    });
+                let inner_instructions = inner_instructions
+                    .map(|inner_instructions| map_inner_instructions(inner_instructions).collect());
 
-                    let tx_status_meta = TransactionStatusMeta {
-                        status,
-                        fee: fee_details.total_fee(),
-                        pre_balances,
-                        post_balances,
-                        pre_token_balances: Some(pre_token_balances),
-                        post_token_balances: Some(post_token_balances),
-                        inner_instructions,
-                        log_messages,
-                        rewards: None,
-                        loaded_addresses: LoadedAddresses::default(),
-                        return_data,
-                        compute_units_consumed: Some(executed_units),
-                    };
+                let tx_status_meta = TransactionStatusMeta {
+                    status,
+                    fee: fee_details.total_fee(),
+                    pre_balances,
+                    post_balances,
+                    pre_token_balances: Some(pre_token_balances),
+                    post_token_balances: Some(post_token_balances),
+                    inner_instructions,
+                    log_messages,
+                    rewards: None,
+                    loaded_addresses: LoadedAddresses::default(),
+                    return_data,
+                    compute_units_consumed: Some(executed_units),
+                };
 
-                    Ok(ConfirmedTransactionWithStatusMeta {
-                        slot: bank.slot(),
-                        tx_with_meta: TransactionWithStatusMeta::Complete(
-                            VersionedTransactionWithStatusMeta {
-                                transaction: VersionedTransaction::from(tx.clone()),
-                                meta: tx_status_meta,
-                            },
-                        ),
-                        block_time: None,
-                    })
+                ConfirmedTransactionWithStatusMeta {
+                    slot: bank.slot(),
+                    tx_with_meta: TransactionWithStatusMeta::Complete(
+                        VersionedTransactionWithStatusMeta {
+                            transaction: VersionedTransaction::from(tx.clone()),
+                            meta: tx_status_meta,
+                        },
+                    ),
+                    block_time: None,
                 }
-                TransactionExecutionResult::NotExecuted(err) => Err(err.clone()),
-            }
+            })
         },
     )
     .collect()
@@ -343,7 +337,7 @@ fn test_program_sbf_loader_deprecated() {
         } = create_genesis_config(50);
         genesis_config
             .accounts
-            .remove(&solana_sdk::feature_set::disable_deploy_of_alloc_free_syscall::id())
+            .remove(&solana_feature_set::disable_deploy_of_alloc_free_syscall::id())
             .unwrap();
         let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let program_id = create_program(&bank, &bpf_loader_deprecated::id(), program);
@@ -747,6 +741,10 @@ fn test_program_sbf_invoke_sanity() {
         let account = AccountSharedData::new(84, 0, &system_program::id());
         bank.store_account(&from_keypair.pubkey(), &account);
 
+        let unexecutable_program_keypair = Keypair::new();
+        let account = AccountSharedData::new(1, 0, &bpf_loader::id());
+        bank.store_account(&unexecutable_program_keypair.pubkey(), &account);
+
         let (derived_key1, bump_seed1) =
             Pubkey::find_program_address(&[b"You pass butter"], &invoke_program_id);
         let (derived_key2, bump_seed2) =
@@ -769,6 +767,7 @@ fn test_program_sbf_invoke_sanity() {
             AccountMeta::new(from_keypair.pubkey(), true),
             AccountMeta::new_readonly(solana_sdk::ed25519_program::id(), false),
             AccountMeta::new_readonly(invoke_program_id, false),
+            AccountMeta::new_readonly(unexecutable_program_keypair.pubkey(), false),
         ];
 
         // success cases
@@ -790,7 +789,7 @@ fn test_program_sbf_invoke_sanity() {
             message.clone(),
             bank.last_blockhash(),
         );
-        let (result, inner_instructions, _log_messages) =
+        let (result, inner_instructions, _log_messages, _executed_units) =
             process_transaction_and_record_inner(&bank, tx);
         assert_eq!(result, Ok(()));
 
@@ -859,11 +858,12 @@ fn test_program_sbf_invoke_sanity() {
 
         // failure cases
 
-        let do_invoke_failure_test_local =
+        let do_invoke_failure_test_local_with_compute_check =
             |test: u8,
              expected_error: TransactionError,
              expected_invoked_programs: &[Pubkey],
-             expected_log_messages: Option<Vec<String>>| {
+             expected_log_messages: Option<Vec<String>>,
+             should_deplete_compute_meter: bool| {
                 println!("Running failure test #{:?}", test);
                 let instruction_data = &[test, bump_seed1, bump_seed2, bump_seed3];
                 let signers = vec![
@@ -872,14 +872,21 @@ fn test_program_sbf_invoke_sanity() {
                     &invoked_argument_keypair,
                     &from_keypair,
                 ];
+                let compute_unit_limit = 1_000_000;
                 let instruction = Instruction::new_with_bytes(
                     invoke_program_id,
                     instruction_data,
                     account_metas.clone(),
                 );
-                let message = Message::new(&[instruction], Some(&mint_pubkey));
+                let message = Message::new(
+                    &[
+                        instruction,
+                        ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
+                    ],
+                    Some(&mint_pubkey),
+                );
                 let tx = Transaction::new(&signers, message.clone(), bank.last_blockhash());
-                let (result, inner_instructions, log_messages) =
+                let (result, inner_instructions, log_messages, executed_units) =
                     process_transaction_and_record_inner(&bank, tx);
                 let invoked_programs: Vec<Pubkey> = inner_instructions[0]
                     .iter()
@@ -888,6 +895,11 @@ fn test_program_sbf_invoke_sanity() {
                     .collect();
                 assert_eq!(result, Err(expected_error));
                 assert_eq!(invoked_programs, expected_invoked_programs);
+                if should_deplete_compute_meter {
+                    assert_eq!(executed_units, compute_unit_limit as u64);
+                } else {
+                    assert!(executed_units < compute_unit_limit as u64);
+                }
                 if let Some(expected_log_messages) = expected_log_messages {
                     assert_eq!(log_messages.len(), expected_log_messages.len());
                     expected_log_messages
@@ -899,6 +911,20 @@ fn test_program_sbf_invoke_sanity() {
                             }
                         });
                 }
+            };
+
+        let do_invoke_failure_test_local =
+            |test: u8,
+             expected_error: TransactionError,
+             expected_invoked_programs: &[Pubkey],
+             expected_log_messages: Option<Vec<String>>| {
+                do_invoke_failure_test_local_with_compute_check(
+                    test,
+                    expected_error,
+                    expected_invoked_programs,
+                    expected_log_messages,
+                    false, // should_deplete_compute_meter
+                )
             };
 
         let program_lang = match program.0 {
@@ -917,6 +943,13 @@ fn test_program_sbf_invoke_sanity() {
             TEST_PRIVILEGE_ESCALATION_WRITABLE,
             TransactionError::InstructionError(0, InstructionError::PrivilegeEscalation),
             &[invoked_program_id.clone()],
+            None,
+        );
+
+        do_invoke_failure_test_local(
+            TEST_PPROGRAM_NOT_OWNED_BY_LOADER,
+            TransactionError::InstructionError(0, InstructionError::AccountNotExecutable),
+            &[],
             None,
         );
 
@@ -1008,11 +1041,12 @@ fn test_program_sbf_invoke_sanity() {
             None,
         );
 
-        do_invoke_failure_test_local(
+        do_invoke_failure_test_local_with_compute_check(
             TEST_WRITABLE_DEESCALATION_WRITABLE,
             TransactionError::InstructionError(0, InstructionError::ReadonlyDataModified),
             &[invoked_program_id.clone()],
             None,
+            true, // should_deplete_compute_meter
         );
 
         do_invoke_failure_test_local(
@@ -1094,7 +1128,7 @@ fn test_program_sbf_invoke_sanity() {
             message.clone(),
             bank.last_blockhash(),
         );
-        let (result, inner_instructions, _log_messages) =
+        let (result, inner_instructions, _log_messages, _executed_units) =
             process_transaction_and_record_inner(&bank, tx);
         let invoked_programs: Vec<Pubkey> = inner_instructions[0]
             .iter()
@@ -1731,7 +1765,7 @@ fn test_program_sbf_invoke_stable_genesis_and_bank() {
             message.clone(),
             bank.last_blockhash(),
         );
-        let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
+        let (result, _, _, _) = process_transaction_and_record_inner(&bank, tx);
         assert_eq!(
             result.unwrap_err(),
             TransactionError::InstructionError(1, InstructionError::InvalidAccountData),
@@ -1778,7 +1812,7 @@ fn test_program_sbf_invoke_stable_genesis_and_bank() {
             message.clone(),
             bank.last_blockhash(),
         );
-        let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
+        let (result, _, _, _) = process_transaction_and_record_inner(&bank, tx);
         assert_eq!(
             result.unwrap_err(),
             TransactionError::InstructionError(1, InstructionError::InvalidAccountData),
@@ -1883,13 +1917,13 @@ fn test_program_sbf_invoke_in_same_tx_as_deployment() {
             bank.last_blockhash(),
         );
         if index == 0 {
-            let results = execute_transactions(&bank, vec![tx]);
+            let result = load_execute_and_commit_transaction(&bank, tx);
             assert_eq!(
-                results[0].as_ref().unwrap_err(),
-                &TransactionError::ProgramAccountNotFound,
+                result.unwrap().status,
+                Err(TransactionError::ProgramAccountNotFound),
             );
         } else {
-            let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
+            let (result, _, _, _) = process_transaction_and_record_inner(&bank, tx);
             assert_eq!(
                 result.unwrap_err(),
                 TransactionError::InstructionError(2, InstructionError::InvalidAccountData),
@@ -2000,7 +2034,7 @@ fn test_program_sbf_invoke_in_same_tx_as_redeployment() {
             message.clone(),
             bank.last_blockhash(),
         );
-        let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
+        let (result, _, _, _) = process_transaction_and_record_inner(&bank, tx);
         assert_eq!(
             result.unwrap_err(),
             TransactionError::InstructionError(1, InstructionError::InvalidAccountData),
@@ -2095,7 +2129,7 @@ fn test_program_sbf_invoke_in_same_tx_as_undeployment() {
             message.clone(),
             bank.last_blockhash(),
         );
-        let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
+        let (result, _, _, _) = process_transaction_and_record_inner(&bank, tx);
         assert_eq!(
             result.unwrap_err(),
             TransactionError::InstructionError(1, InstructionError::InvalidAccountData),
@@ -2241,9 +2275,7 @@ fn test_program_sbf_disguised_as_sbf_loader() {
             ..
         } = create_genesis_config(50);
         let mut bank = Bank::new_for_tests(&genesis_config);
-        bank.deactivate_feature(
-            &solana_sdk::feature_set::remove_bpf_loader_incorrect_program_id::id(),
-        );
+        bank.deactivate_feature(&solana_feature_set::remove_bpf_loader_incorrect_program_id::id());
         let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
         let mut bank_client = BankClient::new_shared(bank);
         let authority_keypair = Keypair::new();
@@ -3855,6 +3887,7 @@ fn test_program_fees() {
         FeeStructure::new(0.000005, 0.0, vec![(200, 0.0000005), (1400000, 0.000005)]);
     bank.set_fee_structure(&fee_structure);
     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+    let feature_set = bank.feature_set.clone();
     let mut bank_client = BankClient::new_shared(bank);
     let authority_keypair = Keypair::new();
 
@@ -3877,13 +3910,18 @@ fn test_program_fees() {
         &ReservedAccountKeys::empty_key_set(),
     )
     .unwrap();
-    let expected_normal_fee = fee_structure.calculate_fee(
+    let fee_budget_limits = FeeBudgetLimits::from(
+        process_compute_budget_instructions(
+            SVMMessage::program_instructions_iter(&sanitized_message),
+            &feature_set,
+        )
+        .unwrap_or_default(),
+    );
+    let expected_normal_fee = solana_fee::calculate_fee(
         &sanitized_message,
-        congestion_multiplier,
-        &process_compute_budget_instructions(sanitized_message.program_instructions_iter())
-            .unwrap_or_default()
-            .into(),
-        false,
+        congestion_multiplier == 0,
+        fee_structure.lamports_per_signature,
+        fee_budget_limits.prioritization_fee,
         true,
     );
     bank_client
@@ -3905,13 +3943,18 @@ fn test_program_fees() {
         &ReservedAccountKeys::empty_key_set(),
     )
     .unwrap();
-    let expected_prioritized_fee = fee_structure.calculate_fee(
+    let fee_budget_limits = FeeBudgetLimits::from(
+        process_compute_budget_instructions(
+            SVMMessage::program_instructions_iter(&sanitized_message),
+            &feature_set,
+        )
+        .unwrap_or_default(),
+    );
+    let expected_prioritized_fee = solana_fee::calculate_fee(
         &sanitized_message,
-        congestion_multiplier,
-        &process_compute_budget_instructions(sanitized_message.program_instructions_iter())
-            .unwrap_or_default()
-            .into(),
-        false,
+        congestion_multiplier == 0,
+        fee_structure.lamports_per_signature,
+        fee_budget_limits.prioritization_fee,
         true,
     );
     assert!(expected_normal_fee < expected_prioritized_fee);
@@ -4145,7 +4188,7 @@ fn test_cpi_account_ownership_writability() {
             );
             let message = Message::new(&[instruction], Some(&mint_pubkey));
             let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
-            let (result, _, logs) = process_transaction_and_record_inner(&bank, tx);
+            let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
             if direct_mapping {
                 assert_eq!(
                     result.unwrap_err(),
@@ -4581,12 +4624,140 @@ fn test_cpi_invalid_account_info_pointers() {
 
             let message = Message::new(&[instruction], Some(&mint_pubkey));
             let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
-            let (result, _, logs) = process_transaction_and_record_inner(&bank, tx);
+            let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
             assert!(result.is_err(), "{result:?}");
             assert!(
                 logs.iter().any(|log| log.contains("Invalid pointer")),
                 "{logs:?}"
             );
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_deplete_cost_meter_with_access_violation() {
+    solana_logger::setup();
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    for deplete_cu_meter_on_vm_failure in [false, true] {
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let feature_set = Arc::make_mut(&mut bank.feature_set);
+        // by default test banks have all features enabled, so we only need to
+        // disable when needed
+        if !deplete_cu_meter_on_vm_failure {
+            feature_set.deactivate(&feature_set::deplete_cu_meter_on_vm_failure::id());
+        }
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let mut bank_client = BankClient::new_shared(bank.clone());
+        let authority_keypair = Keypair::new();
+        let (bank, invoke_program_id) = load_upgradeable_program_and_advance_slot(
+            &mut bank_client,
+            bank_forks.as_ref(),
+            &mint_keypair,
+            &authority_keypair,
+            "solana_sbf_rust_invoke",
+        );
+
+        let account_keypair = Keypair::new();
+        let mint_pubkey = mint_keypair.pubkey();
+        let account_metas = vec![
+            AccountMeta::new(mint_pubkey, true),
+            AccountMeta::new(account_keypair.pubkey(), false),
+            AccountMeta::new_readonly(invoke_program_id, false),
+        ];
+
+        let mut instruction_data = vec![TEST_WRITE_ACCOUNT, 2];
+        instruction_data.extend_from_slice(3usize.to_le_bytes().as_ref());
+        instruction_data.push(42);
+
+        let instruction = Instruction::new_with_bytes(
+            invoke_program_id,
+            &instruction_data,
+            account_metas.clone(),
+        );
+
+        let compute_unit_limit = 10_000u32;
+        let message = Message::new(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
+                instruction,
+            ],
+            Some(&mint_keypair.pubkey()),
+        );
+        let tx = Transaction::new(&[&mint_keypair], message, bank.last_blockhash());
+
+        let result = load_execute_and_commit_transaction(&bank, tx).unwrap();
+
+        assert_eq!(
+            result.status.unwrap_err(),
+            TransactionError::InstructionError(1, InstructionError::ExecutableDataModified)
+        );
+
+        if deplete_cu_meter_on_vm_failure {
+            assert_eq!(result.executed_units, u64::from(compute_unit_limit));
+        } else {
+            assert!(result.executed_units < u64::from(compute_unit_limit));
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_deplete_cost_meter_with_divide_by_zero() {
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(50);
+
+    for deplete_cu_meter_on_vm_failure in [false, true] {
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let feature_set = Arc::make_mut(&mut bank.feature_set);
+        // by default test banks have all features enabled, so we only need to
+        // disable when needed
+        if !deplete_cu_meter_on_vm_failure {
+            feature_set.deactivate(&feature_set::deplete_cu_meter_on_vm_failure::id());
+        }
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let mut bank_client = BankClient::new_shared(bank.clone());
+        let authority_keypair = Keypair::new();
+        let (bank, program_id) = load_upgradeable_program_and_advance_slot(
+            &mut bank_client,
+            bank_forks.as_ref(),
+            &mint_keypair,
+            &authority_keypair,
+            "solana_sbf_rust_divide_by_zero",
+        );
+
+        let instruction = Instruction::new_with_bytes(program_id, &[], vec![]);
+        let compute_unit_limit = 10_000;
+        let message = Message::new(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
+                instruction,
+            ],
+            Some(&mint_keypair.pubkey()),
+        );
+        let tx = Transaction::new(&[&mint_keypair], message, bank.last_blockhash());
+
+        let result = load_execute_and_commit_transaction(&bank, tx).unwrap();
+
+        assert_eq!(
+            result.status.unwrap_err(),
+            TransactionError::InstructionError(1, InstructionError::ProgramFailedToComplete)
+        );
+
+        if deplete_cu_meter_on_vm_failure {
+            assert_eq!(result.executed_units, u64::from(compute_unit_limit));
+        } else {
+            assert!(result.executed_units < u64::from(compute_unit_limit));
         }
     }
 }
@@ -4694,15 +4865,18 @@ fn test_update_callee_account() {
 
         bank.store_account(&account_keypair.pubkey(), &account);
 
-        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 0];
+        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 0, 0];
         instruction_data.extend_from_slice(20480usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(16384usize.to_le_bytes().as_ref());
         // instruction data for inner CPI (2x)
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
 
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
 
@@ -4737,12 +4911,14 @@ fn test_update_callee_account() {
         account.set_data(data);
         bank.store_account(&account_keypair.pubkey(), &account);
 
-        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1];
+        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 0];
         instruction_data.extend_from_slice(20480usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(16384usize.to_le_bytes().as_ref());
         // instruction data for inner CPI
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
         instruction_data.extend_from_slice(19480usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(8129usize.to_le_bytes().as_ref());
 
         let instruction = Instruction::new_with_bytes(
@@ -4777,12 +4953,14 @@ fn test_update_callee_account() {
         account.set_data(data);
         bank.store_account(&account_keypair.pubkey(), &account);
 
-        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1];
+        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 0];
         instruction_data.extend_from_slice(16384usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(16384usize.to_le_bytes().as_ref());
         // instruction data for inner CPI
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
         instruction_data.extend_from_slice(20480usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(16385usize.to_le_bytes().as_ref());
 
         let instruction = Instruction::new_with_bytes(
@@ -4816,20 +4994,24 @@ fn test_update_callee_account() {
         account.set_data(data);
         bank.store_account(&account_keypair.pubkey(), &account);
 
-        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1];
+        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 0];
         instruction_data.extend_from_slice(16384usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(16384usize.to_le_bytes().as_ref());
         // instruction data for inner CPI (2x)
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 1]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 1, 0]);
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
 
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 1]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 1, 0]);
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         // instruction data for inner CPI
-        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0]);
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
         instruction_data.extend_from_slice(20480usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
         instruction_data.extend_from_slice(16385usize.to_le_bytes().as_ref());
 
         let instruction = Instruction::new_with_bytes(
@@ -4856,7 +5038,360 @@ fn test_update_callee_account() {
 
             assert_eq!(*v, expected, "offset:{i} {v:#x} != {expected:#x}");
         });
+
+        // V. clone data, modify and CPI
+        let mut account = AccountSharedData::new(42, 10240, &invoke_program_id);
+        let data: Vec<u8> = (0..10240).map(|n| n as u8).collect();
+        account.set_data(data);
+
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 1];
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(8190usize.to_le_bytes().as_ref());
+
+        // instruction data for inner CPI
+        instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 1, 0]);
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+        instruction_data.extend_from_slice(8191usize.to_le_bytes().as_ref());
+
+        let instruction = Instruction::new_with_bytes(
+            invoke_program_id,
+            &instruction_data,
+            account_metas.clone(),
+        );
+        let result = bank_client.send_and_confirm_instruction(&mint_keypair, instruction);
+
+        if direct_mapping {
+            // changing the data pointer is not permitted
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+
+            let data = bank_client
+                .get_account_data(&account_keypair.pubkey())
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(data.len(), 10240);
+
+            data.iter().enumerate().for_each(|(i, v)| {
+                let expected = match i {
+                    // since the data is was cloned, the write to 8191 was lost
+                    8190 => (i as u8) ^ 0xe5,
+                    ..=10240 => i as u8,
+                    _ => 0,
+                };
+
+                assert_eq!(*v, expected, "offset:{i} {v:#x} != {expected:#x}");
+            });
+        }
     }
+}
+
+#[test]
+fn test_account_info_in_account() {
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    let mut programs = Vec::new();
+    #[cfg(feature = "sbf_c")]
+    {
+        programs.push("invoke");
+    }
+    #[cfg(feature = "sbf_rust")]
+    {
+        programs.push("solana_sbf_rust_invoke");
+    }
+
+    for program in programs {
+        for direct_mapping in [false, true] {
+            let mut bank = Bank::new_for_tests(&genesis_config);
+            let feature_set = Arc::make_mut(&mut bank.feature_set);
+            // by default test banks have all features enabled, so we only need to
+            // disable when needed
+            if !direct_mapping {
+                feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+            }
+
+            let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+            let mut bank_client = BankClient::new_shared(bank.clone());
+            let authority_keypair = Keypair::new();
+
+            let (bank, invoke_program_id) = load_upgradeable_program_and_advance_slot(
+                &mut bank_client,
+                bank_forks.as_ref(),
+                &mint_keypair,
+                &authority_keypair,
+                program,
+            );
+
+            let account_keypair = Keypair::new();
+
+            let mint_pubkey = mint_keypair.pubkey();
+
+            let account_metas = vec![
+                AccountMeta::new(mint_pubkey, true),
+                AccountMeta::new(account_keypair.pubkey(), false),
+                AccountMeta::new_readonly(invoke_program_id, false),
+            ];
+
+            let mut instruction_data = vec![TEST_ACCOUNT_INFO_IN_ACCOUNT];
+            instruction_data.extend_from_slice(32usize.to_le_bytes().as_ref());
+
+            let instruction =
+                Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas);
+
+            let account = AccountSharedData::new(42, 10240, &invoke_program_id);
+
+            bank.store_account(&account_keypair.pubkey(), &account);
+
+            let result = bank_client.send_and_confirm_instruction(&mint_keypair, instruction);
+            if direct_mapping {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_account_info_rc_in_account() {
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    for direct_mapping in [false, true] {
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let feature_set = Arc::make_mut(&mut bank.feature_set);
+        // by default test banks have all features enabled, so we only need to
+        // disable when needed
+        if !direct_mapping {
+            feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+        }
+
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let mut bank_client = BankClient::new_shared(bank.clone());
+        let authority_keypair = Keypair::new();
+
+        let (bank, invoke_program_id) = load_upgradeable_program_and_advance_slot(
+            &mut bank_client,
+            bank_forks.as_ref(),
+            &mint_keypair,
+            &authority_keypair,
+            "solana_sbf_rust_invoke",
+        );
+
+        let account_keypair = Keypair::new();
+
+        let mint_pubkey = mint_keypair.pubkey();
+
+        let account_metas = vec![
+            AccountMeta::new(mint_pubkey, true),
+            AccountMeta::new(account_keypair.pubkey(), false),
+            AccountMeta::new_readonly(invoke_program_id, false),
+        ];
+
+        let instruction_data = vec![TEST_ACCOUNT_INFO_LAMPORTS_RC, 0, 0, 0];
+
+        let instruction = Instruction::new_with_bytes(
+            invoke_program_id,
+            &instruction_data,
+            account_metas.clone(),
+        );
+
+        let account = AccountSharedData::new(42, 10240, &invoke_program_id);
+
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        let message = Message::new(&[instruction], Some(&mint_pubkey));
+        let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+        let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+
+        if direct_mapping {
+            assert!(
+                logs.last().unwrap().ends_with(" failed: Invalid pointer"),
+                "{logs:?}"
+            );
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok(), "{logs:?}");
+        }
+
+        let instruction_data = vec![TEST_ACCOUNT_INFO_DATA_RC, 0, 0, 0];
+
+        let instruction =
+            Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas);
+
+        let account = AccountSharedData::new(42, 10240, &invoke_program_id);
+
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        let message = Message::new(&[instruction], Some(&mint_pubkey));
+        let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+        let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+
+        if direct_mapping {
+            assert!(
+                logs.last().unwrap().ends_with(" failed: Invalid pointer"),
+                "{logs:?}"
+            );
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok(), "{logs:?}");
+        }
+    }
+}
+
+#[test]
+fn test_clone_account_data() {
+    // Test cloning account data works as expect with
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    let feature_set = Arc::make_mut(&mut bank.feature_set);
+
+    feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+
+    let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+    let mut bank_client = BankClient::new_shared(bank.clone());
+    let authority_keypair = Keypair::new();
+
+    let (_, invoke_program_id) = load_upgradeable_program_and_advance_slot(
+        &mut bank_client,
+        bank_forks.as_ref(),
+        &mint_keypair,
+        &authority_keypair,
+        "solana_sbf_rust_invoke",
+    );
+
+    let (bank, invoke_program_id2) = load_upgradeable_program_and_advance_slot(
+        &mut bank_client,
+        bank_forks.as_ref(),
+        &mint_keypair,
+        &authority_keypair,
+        "solana_sbf_rust_invoke",
+    );
+
+    assert_ne!(invoke_program_id, invoke_program_id2);
+
+    println!("invoke_program_id:{invoke_program_id}");
+    println!("invoke_program_id2:{invoke_program_id2}");
+
+    let account_keypair = Keypair::new();
+
+    let mint_pubkey = mint_keypair.pubkey();
+
+    let account_metas = vec![
+        AccountMeta::new(mint_pubkey, true),
+        AccountMeta::new(account_keypair.pubkey(), false),
+        AccountMeta::new_readonly(invoke_program_id2, false),
+        AccountMeta::new_readonly(invoke_program_id, false),
+    ];
+
+    // I. clone data and CPI; modify data in callee.
+    // Now the original data in the caller is unmodified, and we get a "instruction modified data of an account it does not own"
+    // error in the caller
+    let mut account = AccountSharedData::new(42, 10240, &invoke_program_id2);
+    let data: Vec<u8> = (0..10240).map(|n| n as u8).collect();
+    account.set_data(data);
+
+    bank.store_account(&account_keypair.pubkey(), &account);
+
+    let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 1];
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+
+    // instruction data for inner CPI: modify account
+    instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(8190usize.to_le_bytes().as_ref());
+
+    let instruction =
+        Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas.clone());
+
+    let message = Message::new(&[instruction], Some(&mint_pubkey));
+    let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+    let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+    assert!(result.is_err(), "{result:?}");
+    let error = format!("Program {invoke_program_id} failed: instruction modified data of an account it does not own");
+    assert!(logs.iter().any(|log| log.contains(&error)), "{logs:?}");
+
+    // II. clone data, modify and then CPI
+    // The deserialize checks should verify that we're not allowed to modify an account we don't own, even though
+    // we have only modified a copy of the data. Fails in caller
+    let mut account = AccountSharedData::new(42, 10240, &invoke_program_id2);
+    let data: Vec<u8> = (0..10240).map(|n| n as u8).collect();
+    account.set_data(data);
+
+    bank.store_account(&account_keypair.pubkey(), &account);
+
+    let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 1];
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(8190usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+
+    // instruction data for inner CPI
+    instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+
+    let instruction =
+        Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas.clone());
+
+    let message = Message::new(&[instruction], Some(&mint_pubkey));
+    let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+    let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+    assert!(result.is_err(), "{result:?}");
+    let error = format!("Program {invoke_program_id} failed: instruction modified data of an account it does not own");
+    assert!(logs.iter().any(|log| log.contains(&error)), "{logs:?}");
+
+    // II. Clone data, call, modifiy in callee and then make the same change in the caller - transaction succeeds
+    // Note the caller needs to modify the original account data, not the copy
+    let mut account = AccountSharedData::new(42, 10240, &invoke_program_id2);
+    let data: Vec<u8> = (0..10240).map(|n| n as u8).collect();
+    account.set_data(data);
+
+    bank.store_account(&account_keypair.pubkey(), &account);
+
+    let mut instruction_data = vec![TEST_CALLEE_ACCOUNT_UPDATES, 1, 1];
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(8190usize.to_le_bytes().as_ref());
+
+    // instruction data for inner CPI
+    instruction_data.extend_from_slice(&[TEST_CALLEE_ACCOUNT_UPDATES, 0, 0]);
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(0usize.to_le_bytes().as_ref());
+    instruction_data.extend_from_slice(8190usize.to_le_bytes().as_ref());
+
+    let instruction =
+        Instruction::new_with_bytes(invoke_program_id, &instruction_data, account_metas.clone());
+    let result = bank_client.send_and_confirm_instruction(&mint_keypair, instruction);
+
+    // works because the account is exactly the same in caller as callee
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[test]
@@ -4915,12 +5450,217 @@ fn test_stack_heap_zeroed() {
             Some(&mint_pubkey),
         );
         let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
-        let (result, _, logs) = process_transaction_and_record_inner(&bank, tx);
+        let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
         assert!(result.is_err(), "{result:?}");
         assert!(
             logs.iter()
                 .any(|log| log.contains("Cross-program invocation call depth too deep")),
             "{logs:?}"
         );
+    }
+}
+
+#[test]
+fn test_function_call_args() {
+    // This function tests edge compiler edge cases when calling functions with more than five
+    // arguments and passing by value arguments with more than 16 bytes.
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank_client = BankClient::new_shared(bank);
+    let authority_keypair = Keypair::new();
+
+    let (bank, program_id) = load_upgradeable_program_and_advance_slot(
+        &mut bank_client,
+        bank_forks.as_ref(),
+        &mint_keypair,
+        &authority_keypair,
+        "solana_sbf_rust_call_args",
+    );
+
+    #[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Debug)]
+    struct Test128 {
+        a: u128,
+        b: u128,
+    }
+
+    #[derive(BorshSerialize)]
+    struct InputData {
+        test_128: Test128,
+        arg1: i64,
+        arg2: i64,
+        arg3: i64,
+        arg4: i64,
+        arg5: i64,
+        arg6: i64,
+        arg7: i64,
+        arg8: i64,
+    }
+
+    #[derive(BorshDeserialize)]
+    struct OutputData {
+        res_128: u128,
+        res_256: Test128,
+        many_args_1: i64,
+        many_args_2: i64,
+    }
+
+    let input_data = InputData {
+        test_128: Test128 {
+            a: rand::random::<u128>(),
+            b: rand::random::<u128>(),
+        },
+        arg1: rand::random::<i64>(),
+        arg2: rand::random::<i64>(),
+        arg3: rand::random::<i64>(),
+        arg4: rand::random::<i64>(),
+        arg5: rand::random::<i64>(),
+        arg6: rand::random::<i64>(),
+        arg7: rand::random::<i64>(),
+        arg8: rand::random::<i64>(),
+    };
+
+    let instruction_data = to_vec(&input_data).unwrap();
+    let account_metas = vec![
+        AccountMeta::new(mint_keypair.pubkey(), true),
+        AccountMeta::new(Keypair::new().pubkey(), false),
+    ];
+
+    let instruction = Instruction::new_with_bytes(program_id, &instruction_data, account_metas);
+    let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
+
+    let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+
+    let txs = vec![tx];
+    let tx_batch = bank.prepare_batch_for_tests(txs);
+    let result = bank
+        .load_execute_and_commit_transactions(
+            &tx_batch,
+            MAX_PROCESSING_AGE,
+            false,
+            ExecutionRecordingConfig {
+                enable_cpi_recording: false,
+                enable_log_recording: false,
+                enable_return_data_recording: true,
+            },
+            &mut ExecuteTimings::default(),
+            None,
+        )
+        .0;
+
+    fn verify_many_args(input: &InputData) -> i64 {
+        let a = input
+            .arg1
+            .overflowing_add(input.arg2)
+            .0
+            .overflowing_sub(input.arg3)
+            .0
+            .overflowing_add(input.arg4)
+            .0
+            .overflowing_sub(input.arg5)
+            .0;
+        (a % input.arg6)
+            .overflowing_sub(input.arg7)
+            .0
+            .overflowing_add(input.arg8)
+            .0
+    }
+
+    let return_data = &result[0]
+        .as_ref()
+        .unwrap()
+        .return_data
+        .as_ref()
+        .unwrap()
+        .data;
+    let decoded: OutputData = from_slice::<OutputData>(return_data).unwrap();
+    assert_eq!(
+        decoded.res_128,
+        input_data.test_128.a % input_data.test_128.b
+    );
+    assert_eq!(
+        decoded.res_256,
+        Test128 {
+            a: input_data
+                .test_128
+                .a
+                .overflowing_add(input_data.test_128.b)
+                .0,
+            b: input_data
+                .test_128
+                .a
+                .overflowing_sub(input_data.test_128.b)
+                .0
+        }
+    );
+    assert_eq!(decoded.many_args_1, verify_many_args(&input_data));
+    assert_eq!(decoded.many_args_2, verify_many_args(&input_data));
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_mem_syscalls_overlap_account_begin_or_end() {
+    solana_logger::setup();
+
+    for direct_mapping in [false, true] {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(100_123_456_789);
+
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let mut feature_set = FeatureSet::all_enabled();
+        if !direct_mapping {
+            feature_set.deactivate(&feature_set::bpf_account_data_direct_mapping::id());
+        }
+
+        let account_keypair = Keypair::new();
+
+        bank.feature_set = Arc::new(feature_set);
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let mut bank_client = BankClient::new_shared(bank);
+        let authority_keypair = Keypair::new();
+
+        let (bank, program_id) = load_upgradeable_program_and_advance_slot(
+            &mut bank_client,
+            bank_forks.as_ref(),
+            &mint_keypair,
+            &authority_keypair,
+            "solana_sbf_rust_account_mem",
+        );
+
+        let mint_pubkey = mint_keypair.pubkey();
+        let account_metas = vec![
+            AccountMeta::new(mint_pubkey, true),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new(account_keypair.pubkey(), false),
+        ];
+
+        let account = AccountSharedData::new(42, 1024, &program_id);
+        bank.store_account(&account_keypair.pubkey(), &account);
+
+        for instr in 0..=15 {
+            println!("Testing direct_mapping:{direct_mapping} instruction:{instr}");
+            let instruction =
+                Instruction::new_with_bytes(program_id, &[instr], account_metas.clone());
+
+            let message = Message::new(&[instruction], Some(&mint_pubkey));
+            let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+            let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+
+            if direct_mapping {
+                assert!(logs.last().unwrap().ends_with(" failed: InvalidLength"));
+            } else if result.is_err() {
+                // without direct mapping, we should never get the InvalidLength error
+                assert!(!logs.last().unwrap().ends_with(" failed: InvalidLength"));
+            }
+        }
     }
 }

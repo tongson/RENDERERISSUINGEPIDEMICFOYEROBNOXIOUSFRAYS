@@ -13,6 +13,7 @@ use {
         display::println_name_value, CliSignature, CliValidatorsSortOrder, OutputFormat,
     },
     solana_client::connection_cache::ConnectionCache,
+    solana_decode_error::DecodeError,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
@@ -23,7 +24,6 @@ use {
     solana_sdk::{
         clock::{Epoch, Slot},
         commitment_config::CommitmentConfig,
-        decode_error::DecodeError,
         hash::Hash,
         instruction::InstructionError,
         offchain_message::OffchainMessage,
@@ -229,7 +229,6 @@ pub enum CliCommand {
         nonce_authority: SignerIndex,
         memo: Option<String>,
         fee_payer: SignerIndex,
-        redelegation_stake_account: Option<SignerIndex>,
         compute_unit_price: Option<u64>,
     },
     SplitStake {
@@ -270,6 +269,7 @@ pub enum CliCommand {
         use_lamports_unit: bool,
         with_rewards: Option<usize>,
         use_csv: bool,
+        starting_epoch: Option<u64>,
     },
     StakeAuthorize {
         stake_account_pubkey: Pubkey,
@@ -345,6 +345,7 @@ pub enum CliCommand {
         use_lamports_unit: bool,
         use_csv: bool,
         with_rewards: Option<usize>,
+        starting_epoch: Option<u64>,
     },
     WithdrawFromVoteAccount {
         vote_account_pubkey: Pubkey,
@@ -718,8 +719,10 @@ pub fn parse_command(
         ("delegate-stake", Some(matches)) => {
             parse_stake_delegate_stake(matches, default_signer, wallet_manager)
         }
-        ("redelegate-stake", Some(matches)) => {
-            parse_stake_delegate_stake(matches, default_signer, wallet_manager)
+        ("redelegate-stake", _) => {
+            Err(CliError::CommandNotRecognized(
+                "`redelegate-stake` no longer exists and will be completely removed in a future release".to_string(),
+            ))
         }
         ("withdraw-stake", Some(matches)) => {
             parse_stake_withdraw_stake(matches, default_signer, wallet_manager)
@@ -986,7 +989,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
                 timeout,
                 blockhash,
                 *print_timestamp,
-                compute_unit_price.as_ref(),
+                *compute_unit_price,
                 &rpc_client,
             )
         }
@@ -1065,7 +1068,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             new_authority,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         // Create nonce account
         CliCommand::CreateNonceAccount {
@@ -1083,7 +1086,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *amount,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         // Get the current nonce
         CliCommand::GetNonce(nonce_account_pubkey) => {
@@ -1101,7 +1104,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             nonce_account,
             *nonce_authority,
             memo.as_ref(),
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         // Show the contents of a nonce account
         CliCommand::ShowNonceAccount {
@@ -1129,7 +1132,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo.as_ref(),
             destination_account_pubkey,
             *lamports,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         // Upgrade nonce account out of blockhash domain.
         CliCommand::UpgradeNonceAccount {
@@ -1141,7 +1144,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             config,
             *nonce_account,
             memo.as_ref(),
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
 
         // Program Deployment
@@ -1199,7 +1202,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo.as_ref(),
             *fee_payer,
             *from,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::DeactivateStake {
             stake_account_pubkey,
@@ -1228,7 +1231,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo.as_ref(),
             seed.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::DelegateStake {
             stake_account_pubkey,
@@ -1242,7 +1245,6 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             nonce_authority,
             memo,
             fee_payer,
-            redelegation_stake_account,
             compute_unit_price,
         } => process_delegate_stake(
             &rpc_client,
@@ -1258,8 +1260,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            *redelegation_stake_account,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::SplitStake {
             stake_account_pubkey,
@@ -1291,7 +1292,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             seed,
             *lamports,
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
             rent_exempt_reserve.as_ref(),
         ),
         CliCommand::MergeStake {
@@ -1319,13 +1320,14 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::ShowStakeAccount {
             pubkey: stake_account_pubkey,
             use_lamports_unit,
             with_rewards,
             use_csv,
+            starting_epoch,
         } => process_show_stake_account(
             &rpc_client,
             config,
@@ -1333,6 +1335,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *with_rewards,
             *use_csv,
+            *starting_epoch,
         ),
         CliCommand::ShowStakeHistory {
             use_lamports_unit,
@@ -1365,7 +1368,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo.as_ref(),
             *fee_payer,
             *no_wait,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::StakeSetLockup {
             stake_account_pubkey,
@@ -1394,7 +1397,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::WithdrawStake {
             stake_account_pubkey,
@@ -1427,7 +1430,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo.as_ref(),
             seed.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::StakeMinimumDelegation { use_lamports_unit } => {
             process_stake_minimum_delegation(&rpc_client, config, *use_lamports_unit)
@@ -1451,7 +1454,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             validator_info,
             *force_keybase,
             *info_pubkey,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
 
         // Vote Commands
@@ -1488,13 +1491,14 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::ShowVoteAccount {
             pubkey: vote_account_pubkey,
             use_lamports_unit,
             use_csv,
             with_rewards,
+            starting_epoch,
         } => process_show_vote_account(
             &rpc_client,
             config,
@@ -1502,6 +1506,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *use_csv,
             *with_rewards,
+            *starting_epoch,
         ),
         CliCommand::WithdrawFromVoteAccount {
             vote_account_pubkey,
@@ -1530,7 +1535,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::CloseVoteAccount {
             vote_account_pubkey,
@@ -1547,7 +1552,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             destination_account_pubkey,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::VoteAuthorize {
             vote_account_pubkey,
@@ -1578,7 +1583,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::VoteUpdateValidator {
             vote_account_pubkey,
@@ -1605,7 +1610,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         CliCommand::VoteUpdateCommission {
             vote_account_pubkey,
@@ -1632,7 +1637,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
 
         // Wallet Commands
@@ -1696,7 +1701,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *fee_payer,
             derived_address_seed.clone(),
             derived_address_program_id.as_ref(),
-            compute_unit_price.as_ref(),
+            *compute_unit_price,
         ),
         // Address Lookup Table Commands
         CliCommand::AddressLookupTable(subcommand) => {
@@ -2721,5 +2726,26 @@ mod tests {
                 signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap()),],
             }
         );
+    }
+
+    #[test]
+    fn test_cli_completions() {
+        let mut clap_app = get_clap_app("test", "desc", "version");
+
+        let shells = [
+            Shell::Bash,
+            Shell::Fish,
+            Shell::Zsh,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ];
+
+        for shell in shells {
+            let mut buf: Vec<u8> = vec![];
+
+            clap_app.gen_completions_to("solana", shell, &mut buf);
+
+            assert!(!buf.is_empty());
+        }
     }
 }

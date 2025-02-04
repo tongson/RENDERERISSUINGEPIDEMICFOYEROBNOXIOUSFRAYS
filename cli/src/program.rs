@@ -18,7 +18,7 @@ use {
     solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1,
     solana_clap_utils::{
         self,
-        compute_unit_price::compute_unit_price_arg,
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit},
         fee_payer::{fee_payer_arg, FEE_PAYER_ARG},
         hidden_unless_forced,
         input_parsers::*,
@@ -40,6 +40,7 @@ use {
         tpu_client::{TpuClient, TpuClientConfig},
     },
     solana_compute_budget::compute_budget::ComputeBudget,
+    solana_feature_set::{FeatureSet, FEATURE_NAMES},
     solana_program_runtime::invoke_context::InvokeContext,
     solana_rbpf::{elf::Executable, verifier::RequisiteVerifier},
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
@@ -58,7 +59,6 @@ use {
         bpf_loader_upgradeable::{self, get_program_data_address, UpgradeableLoaderState},
         commitment_config::CommitmentConfig,
         compute_budget,
-        feature_set::{FeatureSet, FEATURE_NAMES},
         instruction::{Instruction, InstructionError},
         message::Message,
         packet::PACKET_DATA_SIZE,
@@ -2420,6 +2420,7 @@ fn do_process_program_deploy(
     use_rpc: bool,
 ) -> ProcessResult {
     let blockhash = rpc_client.get_latest_blockhash()?;
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
 
     let (initial_instructions, balance_needed, buffer_program_data) =
         if let Some(buffer_program_data) = buffer_program_data {
@@ -2440,8 +2441,10 @@ fn do_process_program_deploy(
 
     let initial_message = if !initial_instructions.is_empty() {
         Some(Message::new_with_blockhash(
-            &initial_instructions
-                .with_compute_unit_config(&ComputeUnitConfig { compute_unit_price }),
+            &initial_instructions.with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            }),
             Some(&fee_payer_signer.pubkey()),
             &blockhash,
         ))
@@ -2458,8 +2461,10 @@ fn do_process_program_deploy(
             bytes,
         );
 
-        let instructions =
-            vec![instruction].with_compute_unit_config(&ComputeUnitConfig { compute_unit_price });
+        let instructions = vec![instruction].with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
         Message::new_with_blockhash(&instructions, Some(&fee_payer_signer.pubkey()), &blockhash)
     };
 
@@ -2483,7 +2488,10 @@ fn do_process_program_deploy(
                 .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program())?,
             program_data_max_len,
         )?
-        .with_compute_unit_config(&ComputeUnitConfig { compute_unit_price });
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
         Some(Message::new_with_blockhash(
             &instructions,
@@ -2516,6 +2524,7 @@ fn do_process_program_deploy(
         Some(program_signers),
         max_sign_attempts,
         use_rpc,
+        &compute_unit_limit,
     )?;
 
     let program_id = CliProgramId {
@@ -2543,6 +2552,7 @@ fn do_process_write_buffer(
     use_rpc: bool,
 ) -> ProcessResult {
     let blockhash = rpc_client.get_latest_blockhash()?;
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
 
     let (initial_instructions, balance_needed, buffer_program_data) =
         if let Some(buffer_program_data) = buffer_program_data {
@@ -2563,8 +2573,10 @@ fn do_process_write_buffer(
 
     let initial_message = if !initial_instructions.is_empty() {
         Some(Message::new_with_blockhash(
-            &initial_instructions
-                .with_compute_unit_config(&ComputeUnitConfig { compute_unit_price }),
+            &initial_instructions.with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            }),
             Some(&fee_payer_signer.pubkey()),
             &blockhash,
         ))
@@ -2581,8 +2593,10 @@ fn do_process_write_buffer(
             bytes,
         );
 
-        let instructions =
-            vec![instruction].with_compute_unit_config(&ComputeUnitConfig { compute_unit_price });
+        let instructions = vec![instruction].with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
         Message::new_with_blockhash(&instructions, Some(&fee_payer_signer.pubkey()), &blockhash)
     };
 
@@ -2619,6 +2633,7 @@ fn do_process_write_buffer(
         None,
         max_sign_attempts,
         use_rpc,
+        &compute_unit_limit,
     )?;
 
     let buffer = CliProgramBuffer {
@@ -2647,6 +2662,7 @@ fn do_process_program_upgrade(
     use_rpc: bool,
 ) -> ProcessResult {
     let blockhash = rpc_client.get_latest_blockhash()?;
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
 
     let (initial_message, write_messages, balance_needed) = if let Some(buffer_signer) =
         buffer_signer
@@ -2681,8 +2697,10 @@ fn do_process_program_upgrade(
 
         let initial_message = if !initial_instructions.is_empty() {
             Some(Message::new_with_blockhash(
-                &initial_instructions
-                    .with_compute_unit_config(&ComputeUnitConfig { compute_unit_price }),
+                &initial_instructions.with_compute_unit_config(&ComputeUnitConfig {
+                    compute_unit_price,
+                    compute_unit_limit: ComputeUnitLimit::Simulated,
+                }),
                 Some(&fee_payer_signer.pubkey()),
                 &blockhash,
             ))
@@ -2699,7 +2717,10 @@ fn do_process_program_upgrade(
                 offset,
                 bytes,
             )]
-            .with_compute_unit_config(&ComputeUnitConfig { compute_unit_price });
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            });
             Message::new_with_blockhash(&instructions, Some(&fee_payer_signer.pubkey()), &blockhash)
         };
 
@@ -2725,7 +2746,10 @@ fn do_process_program_upgrade(
         &upgrade_authority.pubkey(),
         &fee_payer_signer.pubkey(),
     )]
-    .with_compute_unit_config(&ComputeUnitConfig { compute_unit_price });
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let final_message = Message::new_with_blockhash(
         &final_instructions,
         Some(&fee_payer_signer.pubkey()),
@@ -2757,6 +2781,7 @@ fn do_process_program_upgrade(
         Some(&[upgrade_authority]),
         max_sign_attempts,
         use_rpc,
+        &compute_unit_limit,
     )?;
 
     let program_id = CliProgramId {
@@ -2893,11 +2918,12 @@ fn send_deploy_messages(
     final_signers: Option<&[&dyn Signer]>,
     max_sign_attempts: usize,
     use_rpc: bool,
+    compute_unit_limit: &ComputeUnitLimit,
 ) -> Result<Option<Signature>, Box<dyn std::error::Error>> {
     if let Some(mut message) = initial_message {
         if let Some(initial_signer) = initial_signer {
             trace!("Preparing the required accounts");
-            simulate_and_update_compute_unit_limit(&rpc_client, &mut message)?;
+            simulate_and_update_compute_unit_limit(compute_unit_limit, &rpc_client, &mut message)?;
             let mut initial_transaction = Transaction::new_unsigned(message.clone());
             let blockhash = rpc_client.get_latest_blockhash()?;
 
@@ -2928,7 +2954,11 @@ fn send_deploy_messages(
             {
                 let mut message = write_messages[0].clone();
                 if let UpdateComputeUnitLimitResult::UpdatedInstructionIndex(ix_index) =
-                    simulate_and_update_compute_unit_limit(&rpc_client, &mut message)?
+                    simulate_and_update_compute_unit_limit(
+                        compute_unit_limit,
+                        &rpc_client,
+                        &mut message,
+                    )?
                 {
                     for msg in &mut write_messages {
                         // Write messages are all assumed to be identical except
@@ -3005,7 +3035,7 @@ fn send_deploy_messages(
         if let Some(final_signers) = final_signers {
             trace!("Deploying program");
 
-            simulate_and_update_compute_unit_limit(&rpc_client, &mut message)?;
+            simulate_and_update_compute_unit_limit(compute_unit_limit, &rpc_client, &mut message)?;
             let mut final_tx = Transaction::new_unsigned(message);
             let blockhash = rpc_client.get_latest_blockhash()?;
             let mut signers = final_signers.to_vec();

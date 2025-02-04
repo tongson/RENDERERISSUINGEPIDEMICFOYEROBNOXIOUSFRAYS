@@ -1,4 +1,4 @@
-FROM debian:bullseye
+FROM debian:bookworm
 
 # RPC JSON
 EXPOSE 8899/tcp
@@ -33,7 +33,7 @@ EXPOSE 8008/udp
 # tpu_vote
 EXPOSE 8009/udp
 
-RUN apt update && \
+RUN apt-get update && \
     apt-get install -y bzip2 libssl-dev ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 

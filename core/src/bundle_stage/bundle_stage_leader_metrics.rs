@@ -6,9 +6,11 @@ use {
         },
         immutable_deserialized_bundle::DeserializedBundleError,
     },
-    solana_bundle::{bundle_execution::LoadAndExecuteBundleError, BundleExecutionError},
+    solana_bundle::{
+        bundle_execution::LoadAndExecuteBundleError, BundleExecutionError, SanitizedBundle,
+    },
     solana_poh::poh_recorder::BankStart,
-    solana_sdk::{bundle::SanitizedBundle, clock::Slot, saturating_add_assign},
+    solana_sdk::{clock::Slot, saturating_add_assign},
 };
 
 pub struct BundleStageLeaderMetrics {
@@ -176,7 +178,7 @@ impl BundleStageStatsMetricsTracker {
                             1
                         );
                     }
-                    DeserializedBundleError::FailedToSerializePacket => {
+                    DeserializedBundleError::FailedToSerializePacket(_) => {
                         saturating_add_assign!(
                             bundle_stage_metrics.sanitize_transaction_failed_to_serialize,
                             1
@@ -201,6 +203,12 @@ impl BundleStageStatsMetricsTracker {
                         );
                     }
                     DeserializedBundleError::SignatureVerificationFailure => {
+                        saturating_add_assign!(
+                            bundle_stage_metrics.sanitize_transaction_failed_sig_verify_failed,
+                            1
+                        );
+                    }
+                    DeserializedBundleError::PacketFilterFailure(_) => {
                         saturating_add_assign!(
                             bundle_stage_metrics.sanitize_transaction_failed_sig_verify_failed,
                             1
@@ -258,13 +266,7 @@ impl BundleStageStatsMetricsTracker {
                     saturating_add_assign!(bundle_stage_metrics.bad_argument, 1);
                 }
                 // TODO: Consider adding metrics.
-                Err(
-                    BundleExecutionError::TransactionFailure(
-                        LoadAndExecuteBundleError::AccountInUse,
-                    )
-                    | BundleExecutionError::TipTooLow
-                    | BundleExecutionError::FrontRun,
-                ) => {}
+                Err(BundleExecutionError::TipTooLow | BundleExecutionError::FrontRun) => {}
             }
         }
     }
@@ -392,6 +394,7 @@ pub struct BundleStageStats {
     sanitize_transaction_failed_too_many_packets: u64,
     sanitize_transaction_failed_marked_discard: u64,
     sanitize_transaction_failed_sig_verify_failed: u64,
+    packet_filter_failure: u64,
 
     locked_bundle_elapsed_us: u64,
 
@@ -513,6 +516,7 @@ impl BundleStageStats {
                 self.sanitize_transaction_failed_sig_verify_failed,
                 i64
             ),
+            ("packet_filter_failure", self.packet_filter_failure, i64),
             (
                 "locked_bundle_elapsed_us",
                 self.locked_bundle_elapsed_us,

@@ -2,7 +2,6 @@
 set -e
 cd "$(dirname "$0")/.."
 source ci/semver_bash/semver.sh
-export RUST_STABLE_VERSION=1.81.0
 source ci/rust-version.sh stable
 
 # shellcheck disable=SC2086
@@ -66,7 +65,7 @@ for Cargo_toml in $Cargo_tomls; do
     set -x
 
     crate=$(dirname "$Cargo_toml")
-    cargoCommand="cargo +$rust_stable publish --token $CRATES_IO_TOKEN"
+    cargoCommand="cargo publish --token $CRATES_IO_TOKEN"
 
     numRetries=10
     for ((i = 1; i <= numRetries; i++)); do

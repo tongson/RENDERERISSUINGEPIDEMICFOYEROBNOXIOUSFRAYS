@@ -1,27 +1,25 @@
 use {
     crate::{
         mock_bank::{MockBankCallback, MockForkGraph},
-        proto::{InstrEffects, InstrFixture},
         transaction_builder::SanitizedTransactionBuilder,
     },
     lazy_static::lazy_static,
     prost::Message,
     solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1,
     solana_compute_budget::compute_budget::ComputeBudget,
+    solana_feature_set::{FeatureSet, FEATURE_NAMES},
+    solana_log_collector::LogCollector,
     solana_program_runtime::{
         invoke_context::{EnvironmentConfig, InvokeContext},
         loaded_programs::{ProgramCacheEntry, ProgramCacheForTxBatch, ProgramRuntimeEnvironments},
-        log_collector::LogCollector,
         solana_rbpf::{
             program::{BuiltinProgram, FunctionRegistry},
             vm::Config,
         },
-        timings::ExecuteTimings,
     },
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount, WritableAccount},
         bpf_loader_upgradeable,
-        feature_set::{FeatureSet, FEATURE_NAMES},
         hash::Hash,
         instruction::AccountMeta,
         message::SanitizedMessage,
@@ -38,11 +36,14 @@ use {
         account_loader::CheckedTransactionDetails,
         program_loader,
         transaction_processing_callback::TransactionProcessingCallback,
+        transaction_processing_result::TransactionProcessingResultExtensions,
         transaction_processor::{
             ExecutionRecordingConfig, TransactionBatchProcessor, TransactionProcessingConfig,
             TransactionProcessingEnvironment,
         },
     },
+    solana_svm_conformance::proto::{InstrEffects, InstrFixture},
+    solana_timings::ExecuteTimings,
     std::{
         collections::{HashMap, HashSet},
         env,
@@ -55,9 +56,6 @@ use {
     },
 };
 
-mod proto {
-    include!(concat!(env!("OUT_DIR"), "/org.solana.sealevel.v1.rs"));
-}
 mod mock_bank;
 mod transaction_builder;
 
@@ -151,7 +149,7 @@ fn run_from_folder(base_dir: &PathBuf, run_as_instr: &HashSet<OsString>) {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).expect("Failed to read file");
 
-        let fixture = proto::InstrFixture::decode(buffer.as_slice()).unwrap();
+        let fixture = InstrFixture::decode(buffer.as_slice()).unwrap();
         let execute_as_instr = run_as_instr.contains(&filename);
         run_fixture(fixture, filename, execute_as_instr);
     }
@@ -200,7 +198,7 @@ fn run_fixture(fixture: InstrFixture, filename: OsString, execute_as_instr: bool
     let mut fee_payer = Pubkey::new_unique();
     let mut mock_bank = MockBankCallback::default();
     {
-        let mut account_data_map = mock_bank.account_shared_data.borrow_mut();
+        let mut account_data_map = mock_bank.account_shared_data.write().unwrap();
         for item in input.accounts {
             let pubkey = Pubkey::new_from_array(item.address.try_into().unwrap());
             let mut account_data = AccountSharedData::default();
@@ -246,7 +244,7 @@ fn run_fixture(fixture: InstrFixture, filename: OsString, execute_as_instr: bool
         create_program_runtime_environment_v1(&feature_set, &compute_budget, false, false).unwrap();
 
     mock_bank.override_feature_set(feature_set);
-    let batch_processor = TransactionBatchProcessor::<MockForkGraph>::new(42, 2, HashSet::new());
+    let batch_processor = TransactionBatchProcessor::<MockForkGraph>::new_uninitialized(42, 2);
 
     let fork_graph = Arc::new(RwLock::new(MockForkGraph {}));
     {
@@ -314,17 +312,8 @@ fn run_fixture(fixture: InstrFixture, filename: OsString, execute_as_instr: bool
     );
 
     // Assert that the transaction has worked without errors.
-    if !result.execution_results[0].was_executed()
-        || result.execution_results[0]
-            .details()
-            .unwrap()
-            .status
-            .is_err()
-    {
-        if matches!(
-            result.execution_results[0].flattened_result(),
-            Err(TransactionError::InsufficientFundsForRent { .. })
-        ) {
+    if let Err(err) = result.processing_results[0].flattened_result() {
+        if matches!(err, TransactionError::InsufficientFundsForRent { .. }) {
             // This is a transaction error not an instruction error, so execute the instruction
             // instead.
             execute_fixture_as_instr(
@@ -347,9 +336,14 @@ fn run_fixture(fixture: InstrFixture, filename: OsString, execute_as_instr: bool
         return;
     }
 
-    let execution_details = result.execution_results[0].details().unwrap();
+    let processed_tx = result.processing_results[0]
+        .processed_transaction()
+        .unwrap();
+    let executed_tx = processed_tx.executed_transaction().unwrap();
+    let execution_details = &executed_tx.execution_details;
+    let loaded_accounts = &executed_tx.loaded_transaction.accounts;
     verify_accounts_and_data(
-        &result.loaded_transactions[0].as_ref().unwrap().accounts,
+        loaded_accounts,
         output,
         execution_details.executed_units,
         input.cu_avail,
@@ -439,6 +433,7 @@ fn execute_fixture_as_instr(
         &batch_processor.get_environments_for_epoch(2).unwrap(),
         &program_id,
         42,
+        &mut ExecuteTimings::default(),
         false,
     )
     .unwrap();

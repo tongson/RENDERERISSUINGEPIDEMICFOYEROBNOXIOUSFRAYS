@@ -1,13 +1,17 @@
 use {
     crate::{
         banking_stage::{
-            committer::CommitTransactionDetails, leader_slot_metrics::ProcessTransactionsSummary,
-            leader_slot_timing_metrics::LeaderExecuteAndCommitTimings, qos_service::QosService,
+            committer::CommitTransactionDetails,
+            leader_slot_metrics::{CommittedTransactionsCounts, ProcessTransactionsSummary},
+            leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
+            qos_service::QosService,
             unprocessed_transaction_storage::UnprocessedTransactionStorage,
         },
         bundle_stage::{
+            bundle_account_locker::{BundleAccountLocker, LockedBundle},
             bundle_reserved_space_manager::BundleReservedSpaceManager,
-            bundle_stage_leader_metrics::BundleStageLeaderMetrics, committer::Committer,
+            bundle_stage_leader_metrics::BundleStageLeaderMetrics,
+            committer::Committer,
         },
         immutable_deserialized_bundle::ImmutableDeserializedBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
@@ -15,22 +19,20 @@ use {
     },
     itertools::{izip, Itertools},
     solana_bundle::{
-        bundle_account_locker::{BundleAccountLocker, LockedBundle},
         bundle_execution::{
             load_and_execute_bundle, BundleExecutionMetrics, LoadAndExecuteBundleOutput,
         },
-        BundleExecutionError, BundleExecutionResult, TipError,
+        BundleExecutionError, BundleExecutionResult, SanitizedBundle, TipError,
     },
     solana_cost_model::transaction_cost::TransactionCost,
     solana_gossip::cluster_info::ClusterInfo,
-    solana_measure::{measure, measure_us},
+    solana_measure::measure_us,
     solana_poh::poh_recorder::{BankStart, RecordTransactionsSummary, TransactionRecorder},
     solana_runtime::bank::Bank,
     solana_sdk::{
-        bundle::SanitizedBundle,
         clock::{Slot, MAX_PROCESSING_AGE},
         pubkey::Pubkey,
-        transaction::{self, TransactionError},
+        transaction::{self, SanitizedTransaction, TransactionError},
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
@@ -39,6 +41,11 @@ use {
         time::{Duration, Instant},
     },
 };
+
+type ReserveBundleBlockspaceResult<'a> = BundleExecutionResult<(
+    Vec<transaction::Result<TransactionCost<'a, SanitizedTransaction>>>,
+    u64,
+)>;
 
 pub struct ExecuteRecordCommitResult {
     commit_transaction_details: Vec<CommitTransactionDetails>,
@@ -121,6 +128,8 @@ impl BundleConsumer {
     // A bundle is not allowed to call the Tip Payment program in a bundle (or BankingStage).
     // - This is to avoid stealing of tips by malicious parties with bundles that crank the tip
     // payment program and set the tip receiver to themself.
+    // A bundle is not allowed to touch consensus-related accounts
+    //  - This is to avoid stalling the voting BankingStage threads.
     pub fn consume_buffered_bundles(
         &mut self,
         bank_start: &BankStart,
@@ -184,56 +193,53 @@ impl BundleConsumer {
         // grabbing those locks so BundleStage can process as fast as possible.
         // A LockedBundle is similar to TransactionBatch; once its dropped the locks are released.
         #[allow(clippy::needless_collect)]
-        let (locked_bundle_results, locked_bundles_elapsed) = measure!(
-            bundles
-                .iter()
-                .map(|(_, sanitized_bundle)| {
-                    bundle_account_locker
-                        .prepare_locked_bundle(sanitized_bundle, &bank_start.working_bank)
-                        .map(|locked_bundle| (locked_bundle, sanitized_bundle))
-                })
-                .collect::<Vec<_>>(),
-            "locked_bundles_elapsed"
-        );
-        bundle_stage_leader_metrics
-            .bundle_stage_metrics_tracker()
-            .increment_locked_bundle_elapsed_us(locked_bundles_elapsed.as_us());
-
-        let (execution_results, execute_locked_bundles_elapsed) = measure!(locked_bundle_results
-            .into_iter()
-            .map(|r| match r {
-                Ok((locked_bundle, sanitized_bundle)) => {
-                    let (r, measure) = measure_us!(Self::process_bundle(
-                        bundle_account_locker,
-                        tip_manager,
-                        last_tip_updated_slot,
-                        cluster_info,
-                        block_builder_fee_info,
-                        committer,
-                        recorder,
-                        qos_service,
-                        log_messages_bytes_limit,
-                        max_bundle_retry_duration,
-                        reserved_space,
-                        locked_bundle,
-                        sanitized_bundle,
-                        bank_start,
-                        bundle_stage_leader_metrics,
-                    ));
-                    bundle_stage_leader_metrics
-                        .leader_slot_metrics_tracker()
-                        .increment_process_packets_transactions_us(measure);
-                    r
-                }
-                Err(_) => {
-                    Err(BundleExecutionError::LockError)
-                }
+        let (locked_bundle_results, locked_bundles_elapsed_us) = measure_us!(bundles
+            .iter()
+            .map(|(_, sanitized_bundle)| {
+                bundle_account_locker
+                    .prepare_locked_bundle(sanitized_bundle, &bank_start.working_bank)
             })
             .collect::<Vec<_>>());
+        bundle_stage_leader_metrics
+            .bundle_stage_metrics_tracker()
+            .increment_locked_bundle_elapsed_us(locked_bundles_elapsed_us);
+
+        let (execution_results, execute_locked_bundles_elapsed_us) =
+            measure_us!(locked_bundle_results
+                .into_iter()
+                .map(|r| match r {
+                    Ok(locked_bundle) => {
+                        let (r, measure) = measure_us!(Self::process_bundle(
+                            bundle_account_locker,
+                            tip_manager,
+                            last_tip_updated_slot,
+                            cluster_info,
+                            block_builder_fee_info,
+                            committer,
+                            recorder,
+                            qos_service,
+                            log_messages_bytes_limit,
+                            max_bundle_retry_duration,
+                            reserved_space,
+                            &locked_bundle,
+                            bank_start,
+                            bundle_stage_leader_metrics,
+                            Some(10u64.pow(6) / 10), // 0.1 lamports per CU
+                        ));
+                        bundle_stage_leader_metrics
+                            .leader_slot_metrics_tracker()
+                            .increment_process_packets_transactions_us(measure);
+                        r
+                    }
+                    Err(_) => {
+                        Err(BundleExecutionError::LockError)
+                    }
+                })
+                .collect::<Vec<_>>());
 
         bundle_stage_leader_metrics
             .bundle_stage_metrics_tracker()
-            .increment_execute_locked_bundles_elapsed_us(execute_locked_bundles_elapsed.as_us());
+            .increment_execute_locked_bundles_elapsed_us(execute_locked_bundles_elapsed_us);
         execution_results.iter().for_each(|result| {
             bundle_stage_leader_metrics
                 .bundle_stage_metrics_tracker()
@@ -256,10 +262,10 @@ impl BundleConsumer {
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
         reserved_space: &BundleReservedSpaceManager,
-        locked_bundle: LockedBundle,
-        sanitized_bundle: &SanitizedBundle,
+        locked_bundle: &LockedBundle,
         bank_start: &BankStart,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
+        min_micro_lamports: Option<u64>,
     ) -> Result<(), BundleExecutionError> {
         if !Bank::should_bank_still_be_processing_txs(
             &bank_start.bank_creation_time,
@@ -268,9 +274,11 @@ impl BundleConsumer {
             return Err(BundleExecutionError::BankProcessingTimeLimitReached);
         }
 
-        let tip_accounts = tip_manager.get_tip_accounts();
         if bank_start.working_bank.slot() != *last_tip_updated_slot
-            && Self::bundle_touches_tip_pdas(locked_bundle.sanitized_bundle(), tip_accounts)
+            && Self::bundle_touches_tip_pdas(
+                locked_bundle.sanitized_bundle(),
+                &tip_manager.get_tip_accounts(),
+            )
         {
             let start = Instant::now();
             let result = Self::handle_tip_programs(
@@ -304,13 +312,11 @@ impl BundleConsumer {
             log_messages_bytes_limit,
             max_bundle_retry_duration,
             reserved_space,
-            locked_bundle,
-            sanitized_bundle,
-            tip_accounts,
+            locked_bundle.sanitized_bundle(),
             bank_start,
             bundle_stage_leader_metrics,
-            true,
-            false,
+            tip_manager.get_tip_accounts(),
+            min_micro_lamports,
         )?;
 
         Ok(())
@@ -358,13 +364,11 @@ impl BundleConsumer {
                 log_messages_bytes_limit,
                 max_bundle_retry_duration,
                 reserved_space,
-                locked_init_tip_programs_bundle,
-                &bundle,
-                tip_manager.get_tip_accounts(),
+                locked_init_tip_programs_bundle.sanitized_bundle(),
                 bank_start,
                 bundle_stage_leader_metrics,
-                true,
-                true,
+                tip_manager.get_tip_accounts(),
+                None,
             )
             .map_err(|e| {
                 bundle_stage_leader_metrics
@@ -372,7 +376,8 @@ impl BundleConsumer {
                     .increment_num_init_tip_account_errors(1);
                 error!(
                     "bundle: {} error initializing tip programs: {:?}",
-                    bundle.bundle_id, e
+                    locked_init_tip_programs_bundle.sanitized_bundle().bundle_id,
+                    e
                 );
                 BundleExecutionError::TipError(TipError::InitializeProgramsError)
             })?;
@@ -414,13 +419,11 @@ impl BundleConsumer {
                 log_messages_bytes_limit,
                 max_bundle_retry_duration,
                 reserved_space,
-                locked_tip_crank_bundle,
-                &bundle,
-                tip_manager.get_tip_accounts(),
+                locked_tip_crank_bundle.sanitized_bundle(),
                 bank_start,
                 bundle_stage_leader_metrics,
-                true,
-                true,
+                tip_manager.get_tip_accounts(),
+                None,
             )
             .map_err(|e| {
                 bundle_stage_leader_metrics
@@ -428,7 +431,8 @@ impl BundleConsumer {
                     .increment_num_change_tip_receiver_errors(1);
                 error!(
                     "bundle: {} error cranking tip programs: {:?}",
-                    bundle.bundle_id, e
+                    locked_tip_crank_bundle.sanitized_bundle().bundle_id,
+                    e
                 );
                 BundleExecutionError::TipError(TipError::CrankTipError)
             })?;
@@ -443,12 +447,12 @@ impl BundleConsumer {
 
     /// Reserves space for the entire bundle up-front to ensure the entire bundle can execute.
     /// Rolls back the reserved space if there's not enough blockspace for all transactions in the bundle.
-    fn reserve_bundle_blockspace(
+    fn reserve_bundle_blockspace<'a>(
         qos_service: &QosService,
         reserved_space: &BundleReservedSpaceManager,
-        sanitized_bundle: &SanitizedBundle,
+        sanitized_bundle: &'a SanitizedBundle,
         bank: &Arc<Bank>,
-    ) -> BundleExecutionResult<(Vec<transaction::Result<TransactionCost>>, usize)> {
+    ) -> ReserveBundleBlockspaceResult<'a> {
         let mut write_cost_tracker = bank.write_cost_tracker().unwrap();
 
         // set the block cost limit to the original block cost limit, run the select + accumulate
@@ -478,21 +482,18 @@ impl BundleConsumer {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn update_qos_and_execute_record_commit_bundle(
+    fn update_qos_and_execute_record_commit_bundle(
         committer: &Committer,
         recorder: &TransactionRecorder,
         qos_service: &QosService,
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
         reserved_space: &BundleReservedSpaceManager,
-        locked_bundle: LockedBundle,
         sanitized_bundle: &SanitizedBundle,
-        tip_accounts: &HashSet<Pubkey>,
         bank_start: &BankStart,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
-        fifo: bool,
-        no_drop: bool,
+        tip_accounts: &HashSet<Pubkey>,
+        min_micro_lamports: Option<u64>,
     ) -> BundleExecutionResult<()> {
         debug!(
             "bundle: {} reserving blockspace for {} transactions",
@@ -520,13 +521,11 @@ impl BundleConsumer {
             recorder,
             log_messages_bytes_limit,
             max_bundle_retry_duration,
-            locked_bundle,
             sanitized_bundle,
+            bank_start,
             &transaction_qos_cost_results,
             tip_accounts,
-            bank_start,
-            fifo,
-            no_drop,
+            min_micro_lamports,
         ));
 
         bundle_stage_leader_metrics
@@ -559,11 +558,13 @@ impl BundleConsumer {
                     Err(BundleExecutionError::BankProcessingTimeLimitReached)
                         | Err(BundleExecutionError::PohRecordError(_))
                 ),
-                transactions_attempted_execution_count: sanitized_bundle.transactions.len(),
-                committed_transactions_count: num_committed,
-                // NOTE: this assumes that bundles are committed all-or-nothing
-                committed_transactions_with_successful_result_count: num_committed,
-                failed_commit_count: 0,
+                transaction_counts: CommittedTransactionsCounts {
+                    attempted_processing_count: sanitized_bundle.transactions.len() as u64,
+                    committed_transactions_count: num_committed as u64,
+                    // NOTE: this assumes that bundles are committed all-or-nothing
+                    committed_transactions_with_successful_result_count: num_committed as u64,
+                    processed_but_failed_commit: 0,
+                },
                 retryable_transaction_indexes: vec![],
                 cost_model_throttled_transactions_count: 0,
                 cost_model_us: cost_model_elapsed_us,
@@ -619,19 +620,19 @@ impl BundleConsumer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_record_commit_bundle(
         committer: &Committer,
         recorder: &TransactionRecorder,
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
-        mut locked_bundle: LockedBundle,
         sanitized_bundle: &SanitizedBundle,
-        transaction_qos_cost_results: &[Result<TransactionCost, TransactionError>],
-        tip_accounts: &HashSet<Pubkey>,
         bank_start: &BankStart,
-        fifo: bool,
-        no_drop: bool,
+        transaction_qos_cost_results: &[Result<
+            TransactionCost<'_, SanitizedTransaction>,
+            TransactionError,
+        >],
+        tip_accounts: &HashSet<Pubkey>,
+        min_micro_lamports: Option<u64>,
     ) -> ExecuteRecordCommitResult {
         let transaction_status_sender_enabled = committer.transaction_status_sender_enabled();
 
@@ -641,17 +642,15 @@ impl BundleConsumer {
         let default_accounts = vec![None; sanitized_bundle.transactions.len()];
         let mut bundle_execution_results = load_and_execute_bundle(
             &bank_start.working_bank,
-            Some(&mut locked_bundle),
             sanitized_bundle,
             MAX_PROCESSING_AGE,
             &max_bundle_retry_duration,
             transaction_status_sender_enabled,
             log_messages_bytes_limit,
-            false, // Is simulation.
+            false,
             None,
             &default_accounts,
             &default_accounts,
-            fifo,
         );
 
         let execution_metrics = bundle_execution_results.metrics();
@@ -661,15 +660,7 @@ impl BundleConsumer {
         execute_and_commit_timings
             .execute_timings
             .accumulate(&execution_metrics.execute_timings);
-
-        let mut transaction_error_counter = TransactionErrorMetrics::default();
-        bundle_execution_results
-            .bundle_transaction_results()
-            .iter()
-            .for_each(|r| {
-                transaction_error_counter
-                    .accumulate(&r.load_and_execute_transactions_output().error_counters);
-            });
+        let transaction_error_counter = execution_metrics.errors.clone();
 
         debug!(
             "bundle: {} executed, is_ok: {}",
@@ -685,6 +676,7 @@ impl BundleConsumer {
         );
         let (cu_used, lamports_paid) = economics.unwrap_or_default();
 
+        // don't commit bundle if failure executing any part of the bundle
         if let Err(e) = bundle_execution_results.result() {
             return ExecuteRecordCommitResult {
                 commit_transaction_details: vec![],
@@ -723,16 +715,18 @@ impl BundleConsumer {
         // Compute the bundles total CUs & lamports paid.
         match economics {
             Some((cu_used, lamports_paid)) => {
-                if !no_drop && lamports_paid.saturating_mul(10) / cu_used < 2 {
-                    return ExecuteRecordCommitResult {
-                        commit_transaction_details: vec![],
-                        result: Err(BundleExecutionError::TipTooLow),
-                        execution_metrics,
-                        execute_and_commit_timings,
-                        transaction_error_counter,
-                        cu_used,
-                        lamports_paid,
-                    };
+                if let Some(min_micro_lamports) = min_micro_lamports {
+                    if lamports_paid * 10u64.pow(6) / cu_used < min_micro_lamports {
+                        return ExecuteRecordCommitResult {
+                            commit_transaction_details: vec![],
+                            result: Err(BundleExecutionError::TipTooLow),
+                            execution_metrics,
+                            execute_and_commit_timings,
+                            transaction_error_counter,
+                            cu_used,
+                            lamports_paid,
+                        };
+                    }
                 }
             }
             None => eprintln!("Failed to compute CU & lamports; this shouldn't be possible"),
@@ -754,10 +748,6 @@ impl BundleConsumer {
         let (freeze_lock, freeze_lock_us) = measure_us!(bank_start.working_bank.freeze_lock());
         execute_and_commit_timings.freeze_lock_us = freeze_lock_us;
 
-        let (last_blockhash, lamports_per_signature) = bank_start
-            .working_bank
-            .last_blockhash_and_lamports_per_signature();
-
         let (
             RecordTransactionsSummary {
                 result: record_transactions_result,
@@ -773,7 +763,7 @@ impl BundleConsumer {
         execute_and_commit_timings.record_transactions_timings = record_transactions_timings;
         execute_and_commit_timings
             .record_transactions_timings
-            .execution_results_to_transactions_us = execution_results_to_transactions_us;
+            .processing_results_to_transactions_us = execution_results_to_transactions_us;
 
         debug!(
             "bundle: {} record result: {}",
@@ -797,8 +787,6 @@ impl BundleConsumer {
         // note: execute_and_commit_timings.commit_us handled inside this function
         let (commit_us, commit_bundle_details) = committer.commit_bundle(
             &mut bundle_execution_results,
-            last_blockhash,
-            lamports_per_signature,
             starting_transaction_index,
             &bank_start.working_bank,
             &mut execute_and_commit_timings,
@@ -806,7 +794,6 @@ impl BundleConsumer {
         execute_and_commit_timings.commit_us = commit_us;
 
         drop(freeze_lock);
-        drop(locked_bundle);
 
         // commit_bundle_details contains transactions that were and were not committed
         // given the current implementation only executes, records, and commits bundles
@@ -850,7 +837,10 @@ impl BundleConsumer {
     fn compute_cu_and_lamports(
         tip_accounts: &HashSet<Pubkey>,
         bank_start: &BankStart,
-        transaction_qos_cost_results: &[Result<TransactionCost, TransactionError>],
+        transaction_qos_cost_results: &[Result<
+            TransactionCost<'_, SanitizedTransaction>,
+            TransactionError,
+        >],
         bundle_execution_results: &LoadAndExecuteBundleOutput,
     ) -> Option<(u64, u64)> {
         let mut cu_used = 0u64;
@@ -883,7 +873,7 @@ impl BundleConsumer {
             let fee = bank_start.working_bank.get_fee_for_message(tx.message())?;
             let total_cu = cost
                 .sum()
-                .saturating_add(execution.details()?.executed_units);
+                .saturating_add(execution.as_ref().ok()?.execution_details()?.executed_units);
 
             lamports_paid = lamports_paid.saturating_add(fee);
             cu_used = cu_used.saturating_add(total_cu);
@@ -902,7 +892,7 @@ mod tests {
     use {
         crate::{
             bundle_stage::{
-                bundle_consumer::BundleConsumer,
+                bundle_account_locker::BundleAccountLocker, bundle_consumer::BundleConsumer,
                 bundle_packet_deserializer::BundlePacketDeserializer,
                 bundle_reserved_space_manager::BundleReservedSpaceManager,
                 bundle_stage_leader_metrics::BundleStageLeaderMetrics, committer::Committer,
@@ -910,12 +900,14 @@ mod tests {
             },
             packet_bundle::PacketBundle,
             proxy::block_engine_stage::BlockBuilderFeeInfo,
-            tip_manager::{TipDistributionAccountConfig, TipManager, TipManagerConfig},
+            tip_manager::{
+                tests::MockBlockstore, TipDistributionAccountConfig, TipManager, TipManagerConfig,
+            },
         },
         crossbeam_channel::{unbounded, Receiver},
         jito_tip_distribution::sdk::derive_tip_distribution_account_address,
         rand::{thread_rng, RngCore},
-        solana_bundle::bundle_account_locker::BundleAccountLocker,
+        solana_bundle::SanitizedBundle,
         solana_cost_model::{block_cost_limits::MAX_BLOCK_UNITS, cost_model::CostModel},
         solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_ledger::{
@@ -936,7 +928,7 @@ mod tests {
             prioritization_fee_cache::PrioritizationFeeCache,
         },
         solana_sdk::{
-            bundle::{derive_bundle_id, SanitizedBundle},
+            bundle::derive_bundle_id,
             clock::MAX_PROCESSING_AGE,
             fee_calculator::{FeeRateGovernor, DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE},
             genesis_config::ClusterType,
@@ -1135,20 +1127,33 @@ mod tests {
             .collect()
     }
 
-    fn get_tip_manager(vote_account: &Pubkey) -> TipManager {
-        TipManager::new(TipManagerConfig {
-            tip_payment_program_id: Pubkey::from_str("T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt")
+    fn get_tip_manager(
+        cluster_info: Arc<ClusterInfo>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+        vote_account: &Pubkey,
+        funnel: Option<Pubkey>,
+    ) -> TipManager {
+        TipManager::new(
+            Arc::new(RwLock::new(MockBlockstore(vec![]))),
+            cluster_info,
+            leader_schedule_cache,
+            TipManagerConfig {
+                funnel,
+                tip_payment_program_id: Pubkey::from_str(
+                    "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt",
+                )
                 .unwrap(),
-            tip_distribution_program_id: Pubkey::from_str(
-                "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7",
-            )
-            .unwrap(),
-            tip_distribution_account_config: TipDistributionAccountConfig {
-                merkle_root_upload_authority: Pubkey::new_unique(),
-                vote_account: *vote_account,
-                commission_bps: 10,
+                tip_distribution_program_id: Pubkey::from_str(
+                    "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7",
+                )
+                .unwrap(),
+                tip_distribution_account_config: TipDistributionAccountConfig {
+                    merkle_root_upload_authority: Pubkey::new_unique(),
+                    vote_account: *vote_account,
+                    commission_bps: 10,
+                },
             },
-        })
+        )
     }
 
     /// Happy-path bundle execution w/ no tip management
@@ -1180,18 +1185,24 @@ mod tests {
             Arc::new(PrioritizationFeeCache::new(0u64)),
         );
 
-        let block_builder_pubkey = Pubkey::new_unique();
-        let tip_manager = get_tip_manager(&genesis_config_info.voting_keypair.pubkey());
-        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
-            block_builder: block_builder_pubkey,
-            block_builder_commission: 10,
-        }));
-
         let cluster_info = Arc::new(ClusterInfo::new(
             ContactInfo::new(leader_keypair.pubkey(), 0, 0),
             Arc::new(leader_keypair),
             SocketAddrSpace::new(true),
         ));
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+
+        let tip_manager = get_tip_manager(
+            cluster_info.clone(),
+            leader_schedule_cache,
+            &genesis_config_info.voting_keypair.pubkey(),
+            None,
+        );
+        let block_builder_pubkey = Pubkey::new_unique();
+        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
+            block_builder: block_builder_pubkey,
+            block_builder_commission: 10,
+        }));
 
         let mut consumer = BundleConsumer::new(
             committer,
@@ -1229,8 +1240,8 @@ mod tests {
         );
         let deserialized_bundle = BundlePacketDeserializer::deserialize_bundle(
             packet_bundles.get_mut(0).unwrap(),
-            false,
             None,
+            &Ok,
         )
         .unwrap();
         let mut error_metrics = TransactionErrorMetrics::default();
@@ -1328,18 +1339,24 @@ mod tests {
             Arc::new(PrioritizationFeeCache::new(0u64)),
         );
 
-        let block_builder_pubkey = Pubkey::new_unique();
-        let tip_manager = get_tip_manager(&genesis_config_info.voting_keypair.pubkey());
-        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
-            block_builder: block_builder_pubkey,
-            block_builder_commission: 10,
-        }));
-
         let cluster_info = Arc::new(ClusterInfo::new(
             ContactInfo::new(leader_keypair.pubkey(), 0, 0),
             Arc::new(leader_keypair),
             SocketAddrSpace::new(true),
         ));
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+
+        let block_builder_pubkey = Pubkey::new_unique();
+        let tip_manager = get_tip_manager(
+            cluster_info.clone(),
+            leader_schedule_cache,
+            &genesis_config_info.voting_keypair.pubkey(),
+            None,
+        );
+        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
+            block_builder: block_builder_pubkey,
+            block_builder_commission: 10,
+        }));
 
         let mut consumer = BundleConsumer::new(
             committer,
@@ -1387,7 +1404,7 @@ mod tests {
         };
 
         let deserialized_bundle =
-            BundlePacketDeserializer::deserialize_bundle(&mut packet_bundle, false, None).unwrap();
+            BundlePacketDeserializer::deserialize_bundle(&mut packet_bundle, None, &Ok).unwrap();
         let mut error_metrics = TransactionErrorMetrics::default();
         let sanitized_bundle = deserialized_bundle
             .build_sanitized_bundle(
@@ -1506,18 +1523,24 @@ mod tests {
             Arc::new(PrioritizationFeeCache::new(0u64)),
         );
 
-        let block_builder_pubkey = Pubkey::new_unique();
-        let tip_manager = get_tip_manager(&genesis_config_info.voting_keypair.pubkey());
-        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
-            block_builder: block_builder_pubkey,
-            block_builder_commission: 10,
-        }));
-
         let cluster_info = Arc::new(ClusterInfo::new(
             ContactInfo::new(leader_keypair.pubkey(), 0, 0),
             Arc::new(leader_keypair),
             SocketAddrSpace::new(true),
         ));
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+
+        let block_builder_pubkey = Pubkey::new_unique();
+        let tip_manager = get_tip_manager(
+            cluster_info.clone(),
+            leader_schedule_cache,
+            &genesis_config_info.voting_keypair.pubkey(),
+            None,
+        );
+        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
+            block_builder: block_builder_pubkey,
+            block_builder_commission: 10,
+        }));
 
         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 

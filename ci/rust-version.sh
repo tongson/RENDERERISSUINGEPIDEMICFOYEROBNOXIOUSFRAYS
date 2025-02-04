@@ -29,15 +29,13 @@ fi
 if [[ -n $RUST_NIGHTLY_VERSION ]]; then
   nightly_version="$RUST_NIGHTLY_VERSION"
 else
-  nightly_version=2024-05-02
+  nightly_version=2024-08-08
 fi
 
 
 export rust_stable="$stable_version"
 
 export rust_nightly=nightly-"$nightly_version"
-
-export ci_docker_image="anzaxyz/ci:rust_${rust_stable}_${rust_nightly}"
 
 [[ -z $1 ]] || (
 

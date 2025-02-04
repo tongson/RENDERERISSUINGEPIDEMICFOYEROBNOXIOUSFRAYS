@@ -50,7 +50,7 @@ use {
         pubkey,
         signature::{Keypair, Signature, Signer},
         system_instruction, system_transaction,
-        timing::{duration_as_us, timestamp},
+        timing::timestamp,
         transaction::{Transaction, VersionedTransaction},
     },
     solana_streamer::socket::SocketAddrSpace,
@@ -373,7 +373,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
         bank.clear_signatures();
         trace!(
             "time: {} checked: {} sent: {}",
-            duration_as_us(&now.elapsed()),
+            now.elapsed().as_micros(),
             txes / CHUNKS,
             sent,
         );

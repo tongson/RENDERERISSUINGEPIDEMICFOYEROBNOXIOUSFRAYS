@@ -1,24 +1,22 @@
 use {
-    solana_measure::measure::Measure,
-    solana_program_runtime::{
-        invoke_context::InvokeContext,
-        timings::{ExecuteDetailsTimings, ExecuteTimings},
-    },
+    solana_measure::measure_us,
+    solana_program_runtime::invoke_context::InvokeContext,
     solana_sdk::{
         account::WritableAccount,
-        message::SanitizedMessage,
-        precompiles::is_precompile,
+        precompiles::get_precompile,
         saturating_add_assign,
         sysvar::instructions,
         transaction::TransactionError,
         transaction_context::{IndexOfAccount, InstructionAccount},
     },
+    solana_svm_transaction::svm_message::SVMMessage,
+    solana_timings::{ExecuteDetailsTimings, ExecuteTimings},
 };
 
 #[derive(Debug, Default, Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 pub struct MessageProcessor {}
 
-#[cfg(all(RUSTC_WITH_SPECIALIZATION, feature = "frozen-abi"))]
+#[cfg(feature = "frozen-abi")]
 impl ::solana_frozen_abi::abi_example::AbiExample for MessageProcessor {
     fn example() -> Self {
         // MessageProcessor's fields are #[serde(skip)]-ed and not Serialize
@@ -34,22 +32,18 @@ impl MessageProcessor {
     /// the call does not violate the bank's accounting rules.
     /// The accounts are committed back to the bank only if every instruction succeeds.
     pub fn process_message(
-        message: &SanitizedMessage,
+        message: &impl SVMMessage,
         program_indices: &[Vec<IndexOfAccount>],
         invoke_context: &mut InvokeContext,
         execute_timings: &mut ExecuteTimings,
         accumulated_consumed_units: &mut u64,
     ) -> Result<(), TransactionError> {
-        debug_assert_eq!(program_indices.len(), message.instructions().len());
+        debug_assert_eq!(program_indices.len(), message.num_instructions());
         for (instruction_index, ((program_id, instruction), program_indices)) in message
             .program_instructions_iter()
             .zip(program_indices.iter())
             .enumerate()
         {
-            let is_precompile = is_precompile(program_id, |id| {
-                invoke_context.get_feature_set().is_active(id)
-            });
-
             // Fixup the special instructions key if present
             // before the account pre-values are taken care of
             if let Some(account_index) = invoke_context
@@ -89,53 +83,48 @@ impl MessageProcessor {
                 });
             }
 
-            let result = if is_precompile {
-                invoke_context
-                    .transaction_context
-                    .get_next_instruction_context()
-                    .map(|instruction_context| {
-                        instruction_context.configure(
-                            program_indices,
-                            &instruction_accounts,
-                            &instruction.data,
-                        );
-                    })
-                    .and_then(|_| {
-                        invoke_context.transaction_context.push()?;
-                        invoke_context.transaction_context.pop()
-                    })
-            } else {
-                let time = Measure::start("execute_instruction");
-                let mut compute_units_consumed = 0;
-                let result = invoke_context.process_instruction(
-                    &instruction.data,
-                    &instruction_accounts,
-                    program_indices,
-                    &mut compute_units_consumed,
-                    execute_timings,
-                );
-                let time = time.end_as_us();
-                *accumulated_consumed_units =
-                    accumulated_consumed_units.saturating_add(compute_units_consumed);
-                execute_timings.details.accumulate_program(
-                    program_id,
-                    time,
-                    compute_units_consumed,
-                    result.is_err(),
-                );
-                invoke_context.timings = {
-                    execute_timings.details.accumulate(&invoke_context.timings);
-                    ExecuteDetailsTimings::default()
-                };
-                saturating_add_assign!(
-                    execute_timings
-                        .execute_accessories
-                        .process_instructions
-                        .total_us,
-                    time
-                );
-                result
+            let mut compute_units_consumed = 0;
+            let (result, process_instruction_us) = measure_us!({
+                if let Some(precompile) = get_precompile(program_id, |feature_id| {
+                    invoke_context.get_feature_set().is_active(feature_id)
+                }) {
+                    invoke_context.process_precompile(
+                        precompile,
+                        instruction.data,
+                        &instruction_accounts,
+                        program_indices,
+                        message.instructions_iter().map(|ix| ix.data),
+                    )
+                } else {
+                    invoke_context.process_instruction(
+                        instruction.data,
+                        &instruction_accounts,
+                        program_indices,
+                        &mut compute_units_consumed,
+                        execute_timings,
+                    )
+                }
+            });
+
+            *accumulated_consumed_units =
+                accumulated_consumed_units.saturating_add(compute_units_consumed);
+            execute_timings.details.accumulate_program(
+                program_id,
+                process_instruction_us,
+                compute_units_consumed,
+                result.is_err(),
+            );
+            invoke_context.timings = {
+                execute_timings.details.accumulate(&invoke_context.timings);
+                ExecuteDetailsTimings::default()
             };
+            saturating_add_assign!(
+                execute_timings
+                    .execute_accessories
+                    .process_instructions
+                    .total_us,
+                process_instruction_us
+            );
 
             result
                 .map_err(|err| TransactionError::InstructionError(instruction_index as u8, err))?;
@@ -149,6 +138,7 @@ mod tests {
     use {
         super::*,
         solana_compute_budget::compute_budget::ComputeBudget,
+        solana_feature_set::FeatureSet,
         solana_program_runtime::{
             declare_process_instruction,
             invoke_context::EnvironmentConfig,
@@ -157,10 +147,9 @@ mod tests {
         },
         solana_sdk::{
             account::{AccountSharedData, ReadableAccount},
-            feature_set::FeatureSet,
             hash::Hash,
             instruction::{AccountMeta, Instruction, InstructionError},
-            message::{AccountKeys, Message},
+            message::{AccountKeys, Message, SanitizedMessage},
             native_loader::{self, create_loadable_account_for_test},
             pubkey::Pubkey,
             rent::Rent,
@@ -171,15 +160,6 @@ mod tests {
         },
         std::sync::Arc,
     };
-
-    #[derive(Debug, serde_derive::Serialize, serde_derive::Deserialize)]
-    enum MockInstruction {
-        NoopSuccess,
-        NoopFail,
-        ModifyOwned,
-        ModifyNotOwned,
-        ModifyReadonly,
-    }
 
     fn new_sanitized_message(message: Message) -> SanitizedMessage {
         SanitizedMessage::try_from_legacy_message(message, &ReservedAccountKeys::empty_key_set())

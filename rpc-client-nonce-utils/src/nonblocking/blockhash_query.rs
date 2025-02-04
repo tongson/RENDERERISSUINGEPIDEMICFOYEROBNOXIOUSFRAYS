@@ -1,13 +1,16 @@
 use {
     crate::nonblocking,
+    solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    solana_sdk::{commitment_config::CommitmentConfig, hash::Hash, pubkey::Pubkey},
+};
+#[cfg(feature = "clap")]
+use {
     clap::ArgMatches,
     solana_clap_utils::{
         input_parsers::{pubkey_of, value_of},
         nonce::*,
         offline::*,
     },
-    solana_rpc_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{commitment_config::CommitmentConfig, hash::Hash, pubkey::Pubkey},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -76,6 +79,7 @@ impl BlockhashQuery {
         }
     }
 
+    #[cfg(feature = "clap")]
     pub fn new_from_matches(matches: &ArgMatches<'_>) -> Self {
         let blockhash = value_of(matches, BLOCKHASH_ARG.name);
         let sign_only = matches.is_present(SIGN_ONLY_ARG.name);
@@ -112,12 +116,13 @@ impl Default for BlockhashQuery {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "clap")]
+    use clap::App;
     use {
         super::*,
         crate::nonblocking::blockhash_query,
-        clap::App,
         serde_json::{self, json},
-        solana_account_decoder::{UiAccount, UiAccountEncoding},
+        solana_account_decoder::{encode_ui_account, UiAccountEncoding},
         solana_rpc_client_api::{
             request::RpcRequest,
             response::{Response, RpcBlockhash, RpcResponseContext},
@@ -180,6 +185,7 @@ mod tests {
         BlockhashQuery::new(None, true, Some(nonce_pubkey));
     }
 
+    #[cfg(feature = "clap")]
     #[test]
     fn test_blockhash_query_new_from_matches_ok() {
         let test_commands = App::new("blockhash_query_test")
@@ -248,6 +254,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "clap")]
     #[test]
     #[should_panic]
     fn test_blockhash_query_new_from_matches_without_nonce_fail() {
@@ -261,6 +268,7 @@ mod tests {
         BlockhashQuery::new_from_matches(&matches);
     }
 
+    #[cfg(feature = "clap")]
     #[test]
     #[should_panic]
     fn test_blockhash_query_new_from_matches_with_nonce_fail() {
@@ -373,7 +381,7 @@ mod tests {
         )
         .unwrap();
         let nonce_pubkey = Pubkey::from([4u8; 32]);
-        let rpc_nonce_account = UiAccount::encode(
+        let rpc_nonce_account = encode_ui_account(
             &nonce_pubkey,
             &nonce_account,
             UiAccountEncoding::Base64,

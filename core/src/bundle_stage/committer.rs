@@ -7,13 +7,13 @@ use {
     solana_ledger::blockstore_processor::TransactionStatusSender,
     solana_measure::measure_us,
     solana_runtime::{
-        bank::{Bank, ExecutedTransactionCounts, TransactionBalances, TransactionBalancesSet},
+        bank::{Bank, TransactionBalances, TransactionBalancesSet},
         bank_utils,
         prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_sdk::{hash::Hash, saturating_add_assign, transaction::SanitizedTransaction},
-    solana_svm::transaction_results::TransactionResults,
+    solana_sdk::{saturating_add_assign, transaction::SanitizedTransaction},
+    solana_svm::transaction_commit_result::TransactionCommitResult,
     solana_transaction_status::{
         token_balances::{TransactionTokenBalances, TransactionTokenBalancesSet},
         PreBalanceInfo,
@@ -56,8 +56,6 @@ impl Committer {
     pub(crate) fn commit_bundle<'a>(
         &self,
         bundle_execution_output: &'a mut LoadAndExecuteBundleOutput<'a>,
-        last_blockhash: Hash,
-        lamports_per_signature: u64,
         mut starting_transaction_index: Option<usize>,
         bank: &Arc<Bank>,
         execute_and_commit_timings: &mut LeaderExecuteAndCommitTimings,
@@ -67,91 +65,52 @@ impl Committer {
         let (commit_transaction_details, commit_times): (Vec<_>, Vec<_>) = transaction_output
             .iter_mut()
             .map(|bundle_results| {
-                let executed_transactions_count = bundle_results
-                    .load_and_execute_transactions_output()
-                    .executed_transactions_count
-                    as u64;
-
-                let executed_non_vote_transactions_count = bundle_results
-                    .load_and_execute_transactions_output()
-                    .executed_non_vote_transactions_count
-                    as u64;
-
-                let executed_with_failure_result_count = bundle_results
-                    .load_and_execute_transactions_output()
-                    .executed_transactions_count
-                    .saturating_sub(
-                        bundle_results
-                            .load_and_execute_transactions_output()
-                            .executed_with_successful_result_count,
-                    ) as u64;
-
-                let signature_count = bundle_results
-                    .load_and_execute_transactions_output()
-                    .signature_count;
-
-                let sanitized_transactions = bundle_results.transactions().to_vec();
                 let execution_results = bundle_results.execution_results().to_vec();
 
-                let loaded_transactions = bundle_results.loaded_transactions_mut();
-                debug!("loaded_transactions: {:?}", loaded_transactions);
-
-                let (tx_results, commit_time_us) = measure_us!(bank.commit_transactions(
-                    &sanitized_transactions,
-                    loaded_transactions,
+                let (commit_results, commit_time_us) = measure_us!(bank.commit_transactions(
+                    bundle_results.transactions(),
                     execution_results,
-                    last_blockhash,
-                    lamports_per_signature,
-                    ExecutedTransactionCounts {
-                        executed_transactions_count,
-                        executed_non_vote_transactions_count,
-                        executed_with_failure_result_count,
-                        signature_count,
-                    },
+                    &bundle_results
+                        .load_and_execute_transactions_output()
+                        .processed_counts,
                     &mut execute_and_commit_timings.execute_timings,
                 ));
+                saturating_add_assign!(execute_and_commit_timings.commit_us, commit_time_us);
 
-                let commit_transaction_statuses: Vec<_> = tx_results
-                    .execution_results
+                let commit_transaction_statuses: Vec<CommitTransactionDetails> = commit_results
                     .iter()
-                    .zip(tx_results.loaded_accounts_stats.iter())
-                    .map(|(execution_result, loaded_accounts_stats)| {
-                        match execution_result.details() {
-                            // reports actual execution CUs, and actual loaded accounts size for
-                            // transaction committed to block. qos_service uses these information to adjust
-                            // reserved block space.
-                            Some(details) => CommitTransactionDetails::Committed {
-                                compute_units: details.executed_units,
-                                loaded_accounts_data_size: loaded_accounts_stats
-                                    .as_ref()
-                                    .map_or(0, |stats| stats.loaded_accounts_data_size),
-                            },
-                            None => CommitTransactionDetails::NotCommitted,
-                        }
+                    .map(|commit_result| match commit_result {
+                        // reports actual execution CUs, and actual loaded accounts size for
+                        // transaction committed to block. qos_service uses these information to adjust
+                        // reserved block space.
+                        Ok(committed_tx) => CommitTransactionDetails::Committed {
+                            compute_units: committed_tx.executed_units,
+                            loaded_accounts_data_size: committed_tx
+                                .loaded_account_stats
+                                .loaded_accounts_data_size,
+                        },
+                        Err(_) => CommitTransactionDetails::NotCommitted,
                     })
                     .collect();
+                let num_committed = commit_transaction_statuses
+                    .iter()
+                    .filter(|status| matches!(status, CommitTransactionDetails::Committed { .. }))
+                    .count();
 
                 let ((), find_and_send_votes_us) = measure_us!({
                     bank_utils::find_and_send_votes(
-                        &sanitized_transactions,
-                        &tx_results,
+                        bundle_results.transactions(),
+                        &commit_results,
                         Some(&self.replay_vote_sender),
                     );
 
                     let post_balance_info = bundle_results.post_balance_info().clone();
-                    let pre_balance_info = bundle_results.pre_balance_info_mut();
-
-                    let num_committed = tx_results
-                        .execution_results
-                        .iter()
-                        .filter(|r| r.was_executed())
-                        .count();
 
                     self.collect_balances_and_send_status_batch(
-                        tx_results,
+                        commit_results,
                         bank,
-                        sanitized_transactions,
-                        pre_balance_info,
+                        bundle_results.transactions(),
+                        &mut bundle_results.pre_balance_info().clone(),
                         post_balance_info,
                         starting_transaction_index,
                     );
@@ -185,20 +144,19 @@ impl Committer {
 
     fn collect_balances_and_send_status_batch(
         &self,
-        tx_results: TransactionResults,
+        commit_results: Vec<TransactionCommitResult>,
         bank: &Arc<Bank>,
-        sanitized_transactions: Vec<SanitizedTransaction>,
+        sanitized_transactions: &[SanitizedTransaction],
         pre_balance_info: &mut PreBalanceInfo,
         (post_balances, post_token_balances): (TransactionBalances, TransactionTokenBalances),
         starting_transaction_index: Option<usize>,
     ) {
         if let Some(transaction_status_sender) = &self.transaction_status_sender {
             let mut transaction_index = starting_transaction_index.unwrap_or_default();
-            let batch_transaction_indexes: Vec<_> = tx_results
-                .execution_results
+            let batch_transaction_indexes: Vec<_> = commit_results
                 .iter()
                 .map(|result| {
-                    if result.was_executed() {
+                    if result.is_ok() {
                         let this_transaction_index = transaction_index;
                         saturating_add_assign!(transaction_index, 1);
                         this_transaction_index
@@ -208,9 +166,9 @@ impl Committer {
                 })
                 .collect();
             transaction_status_sender.send_transaction_status_batch(
-                bank.clone(),
-                sanitized_transactions,
-                tx_results.execution_results,
+                bank.slot(),
+                sanitized_transactions.to_vec(),
+                commit_results,
                 TransactionBalancesSet::new(
                     std::mem::take(&mut pre_balance_info.native),
                     post_balances,
@@ -219,7 +177,6 @@ impl Committer {
                     std::mem::take(&mut pre_balance_info.token),
                     post_token_balances,
                 ),
-                tx_results.rent_debits,
                 batch_transaction_indexes,
             );
         }

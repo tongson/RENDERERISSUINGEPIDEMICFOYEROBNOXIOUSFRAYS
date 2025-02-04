@@ -3,13 +3,9 @@ use {
     bv::BitVec,
     itertools::Itertools,
     rand::Rng,
-    solana_sdk::{
-        clock::Slot,
-        hash::Hash,
-        pubkey::Pubkey,
-        sanitize::{Sanitize, SanitizeError},
-        serde_varint,
-    },
+    solana_sanitize::{Sanitize, SanitizeError},
+    solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey},
+    solana_serde_varint as serde_varint,
     thiserror::Error,
 };
 

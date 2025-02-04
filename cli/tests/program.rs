@@ -11,12 +11,11 @@ use {
         test_utils::wait_n_slots,
     },
     solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
-    solana_client::{
-        rpc_client::GetConfirmedSignaturesForAddress2Config, rpc_config::RpcTransactionConfig,
-    },
     solana_faucet::faucet::run_local_faucet,
+    solana_feature_set::enable_alt_bn128_syscall,
     solana_rpc::rpc::JsonRpcConfig,
-    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient},
+    solana_rpc_client_api::config::RpcTransactionConfig,
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
     solana_sdk::{
         account::ReadableAccount,
@@ -25,7 +24,6 @@ use {
         bpf_loader_upgradeable::{self, UpgradeableLoaderState},
         commitment_config::CommitmentConfig,
         compute_budget::{self, ComputeBudgetInstruction},
-        feature_set::enable_alt_bn128_syscall,
         fee_calculator::FeeRateGovernor,
         pubkey::Pubkey,
         rent::Rent,

@@ -1,19 +1,22 @@
 use {
     super::packet_filter::PacketFilterFailure,
+    solana_compute_budget::compute_budget_limits::ComputeBudgetLimits,
     solana_perf::packet::Packet,
-    solana_runtime::{
-        bank::Bank,
-        compute_budget_details::{ComputeBudgetDetails, GetComputeBudgetDetails},
-    },
+    solana_runtime::bank::Bank,
+    solana_runtime_transaction::instructions_processor::process_compute_budget_instructions,
+    solana_sanitize::SanitizeError,
     solana_sdk::{
         clock::Slot,
+        feature_set::FeatureSet,
         hash::Hash,
         message::{v0::LoadedAddresses, AddressLoaderError, Message, SimpleAddressLoader},
         pubkey::Pubkey,
-        sanitize::SanitizeError,
-        short_vec::decode_shortu16_len,
         signature::Signature,
         transaction::{SanitizedTransaction, SanitizedVersionedTransaction, VersionedTransaction},
+    },
+    solana_short_vec::decode_shortu16_len,
+    solana_svm_transaction::{
+        instruction::SVMInstruction, message_address_table_lookup::SVMMessageAddressTableLookup,
     },
     std::{cmp::Ordering, collections::HashSet, mem::size_of},
     thiserror::Error,
@@ -38,13 +41,20 @@ pub enum DeserializedPacketError {
     FailedFilter(#[from] PacketFilterFailure),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+lazy_static::lazy_static! {
+    // Make a dummy feature_set with all features enabled to
+    // fetch compute_unit_price and compute_unit_limit for legacy leader.
+    static ref FEATURE_SET: FeatureSet = FeatureSet::all_enabled();
+}
+
+#[derive(Debug, Eq)]
 pub struct ImmutableDeserializedPacket {
     original_packet: Packet,
     transaction: SanitizedVersionedTransaction,
     message_hash: Hash,
     is_simple_vote: bool,
-    compute_budget_details: ComputeBudgetDetails,
+    compute_unit_price: u64,
+    compute_unit_limit: u32,
 }
 
 impl ImmutableDeserializedPacket {
@@ -56,13 +66,22 @@ impl ImmutableDeserializedPacket {
         let is_simple_vote = packet.meta().is_simple_vote_tx();
 
         // drop transaction if prioritization fails.
-        let mut compute_budget_details = sanitized_transaction
-            .get_compute_budget_details(packet.meta().round_compute_unit_price())
-            .ok_or(DeserializedPacketError::PrioritizationFailure)?;
+        let ComputeBudgetLimits {
+            mut compute_unit_price,
+            compute_unit_limit,
+            ..
+        } = process_compute_budget_instructions(
+            sanitized_transaction
+                .get_message()
+                .program_instructions_iter()
+                .map(|(pubkey, ix)| (pubkey, SVMInstruction::from(ix))),
+            &FEATURE_SET,
+        )
+        .map_err(|_| DeserializedPacketError::PrioritizationFailure)?;
 
         // set compute unit price to zero for vote transactions
         if is_simple_vote {
-            compute_budget_details.compute_unit_price = 0;
+            compute_unit_price = 0;
         };
 
         Ok(Self {
@@ -70,7 +89,8 @@ impl ImmutableDeserializedPacket {
             transaction: sanitized_transaction,
             message_hash,
             is_simple_vote,
-            compute_budget_details,
+            compute_unit_price,
+            compute_unit_limit,
         })
     }
 
@@ -91,15 +111,11 @@ impl ImmutableDeserializedPacket {
     }
 
     pub fn compute_unit_price(&self) -> u64 {
-        self.compute_budget_details.compute_unit_price
+        self.compute_unit_price
     }
 
     pub fn compute_unit_limit(&self) -> u64 {
-        self.compute_budget_details.compute_unit_limit
-    }
-
-    pub fn compute_budget_details(&self) -> ComputeBudgetDetails {
-        self.compute_budget_details.clone()
+        u64::from(self.compute_unit_limit)
     }
 
     // This function deserializes packets into transactions, computes the blake3 hash of transaction
@@ -124,6 +140,7 @@ impl ImmutableDeserializedPacket {
             self.transaction().clone(),
             *self.message_hash(),
             self.is_simple_vote(),
+            self.original_packet.meta().is_drop_on_revert_packet(),
             address_loader,
             reserved_account_keys,
         )
@@ -140,7 +157,18 @@ impl ImmutableDeserializedPacket {
             return Ok((LoadedAddresses::default(), Slot::MAX));
         };
 
-        bank.load_addresses_from_ref(address_table_lookups.iter())
+        bank.load_addresses_from_ref(
+            address_table_lookups
+                .iter()
+                .map(SVMMessageAddressTableLookup::from),
+        )
+    }
+}
+
+// PartialEq MUST be consistent with PartialOrd and Ord
+impl PartialEq for ImmutableDeserializedPacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.compute_unit_price() == other.compute_unit_price()
     }
 }
 
