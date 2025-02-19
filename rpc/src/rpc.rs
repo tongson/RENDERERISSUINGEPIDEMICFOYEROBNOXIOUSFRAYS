@@ -3565,7 +3565,7 @@ pub mod utils {
             }
             BundleExecutionError::TipError(e) => RpcBundleExecutionError::TipError(e.to_string()),
             // NB: Lie about the error as to not break downstream consumers.
-            BundleExecutionError::TipTooLow | BundleExecutionError::FrontRun => {
+            BundleExecutionError::FrontRun => {
                 RpcBundleExecutionError::TipError(TipError::CrankTipError.to_string())
             }
         }

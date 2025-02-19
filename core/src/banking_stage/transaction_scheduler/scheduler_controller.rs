@@ -3,7 +3,7 @@
 
 use {
     super::{
-        greedy_scheduler::GreedyScheduler,
+        scheduler::Scheduler,
         scheduler_error::SchedulerError,
         scheduler_metrics::{
             SchedulerCountMetrics, SchedulerLeaderDetectionMetrics, SchedulerTimingMetrics,
@@ -46,7 +46,11 @@ use {
 };
 
 /// Controls packet and transaction flow into scheduler, and scheduling execution.
-pub(crate) struct SchedulerController<T: LikeClusterInfo> {
+pub(crate) struct SchedulerController<C, S>
+where
+    C: LikeClusterInfo,
+    S: Scheduler,
+{
     /// Decision maker for determining what should be done with transactions.
     decision_maker: DecisionMaker,
     /// Packet/Transaction ingress.
@@ -58,7 +62,7 @@ pub(crate) struct SchedulerController<T: LikeClusterInfo> {
     /// Shared resource between `packet_receiver` and `scheduler`.
     container: TransactionStateContainer,
     /// State for scheduling and communicating with worker threads.
-    scheduler: GreedyScheduler,
+    scheduler: S,
     /// Metrics tracking time for leader bank detection.
     leader_detection_metrics: SchedulerLeaderDetectionMetrics,
     /// Metrics tracking counts on transactions in different states
@@ -70,17 +74,25 @@ pub(crate) struct SchedulerController<T: LikeClusterInfo> {
     /// Metric report handles for the worker threads.
     worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     /// State for forwarding packets to the leader, if enabled.
-    forwarder: Option<Forwarder<T>>,
+    forwarder: Option<Forwarder<C>>,
+    batch: Vec<ImmutableDeserializedPacket>,
+    batch_start: Instant,
+    batch_interval: Duration,
 }
 
-impl<T: LikeClusterInfo> SchedulerController<T> {
+impl<C, S> SchedulerController<C, S>
+where
+    C: LikeClusterInfo,
+    S: Scheduler,
+{
     pub fn new(
         decision_maker: DecisionMaker,
         packet_deserializer: PacketDeserializer,
         bank_forks: Arc<RwLock<BankForks>>,
-        scheduler: GreedyScheduler,
+        scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
-        forwarder: Option<Forwarder<T>>,
+        forwarder: Option<Forwarder<C>>,
+        batch_interval: Duration,
     ) -> Self {
         Self {
             decision_maker,
@@ -94,6 +106,9 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
             timing_metrics: SchedulerTimingMetrics::default(),
             worker_metrics,
             forwarder,
+            batch: Vec::default(),
+            batch_start: Instant::now(),
+            batch_interval,
         }
     }
 
@@ -123,6 +138,7 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
                 .maybe_report_and_reset_slot(new_leader_slot);
 
             self.receive_completed()?;
+            self.maybe_queue_batch();
             self.process_transactions(&decision)?;
             if !self.receive_and_buffer_packets(&decision) {
                 break;
@@ -140,10 +156,24 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
                 .maybe_report_and_reset_interval(should_report);
             self.worker_metrics
                 .iter()
-                .for_each(|metrics| metrics.maybe_report_and_reset(new_leader_slot));
+                .for_each(|metrics| metrics.maybe_report_and_reset());
         }
 
         Ok(())
+    }
+
+    fn maybe_queue_batch(&mut self) {
+        if !self.batch.is_empty() && self.batch_start.elapsed() > self.batch_interval {
+            let (_, buffer_time_us) = measure_us!(Self::buffer_packets(
+                &self.bank_forks,
+                &mut self.container,
+                &mut self.transaction_id_generator,
+                &mut self.count_metrics,
+                self.batch.drain(..),
+            ));
+            self.timing_metrics
+                .update(|metrics| saturating_add_assign!(metrics.buffer_time_us, buffer_time_us));
+        }
     }
 
     /// Process packets based on decision.
@@ -474,11 +504,13 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
                 });
 
                 if should_buffer {
-                    let (_, buffer_time_us) = measure_us!(
-                        self.buffer_packets(receive_packet_results.deserialized_packets)
-                    );
+                    // Packets are not immediately schedulable but are instead
+                    // grouped into 50ms batches (measured from the recv time of
+                    // the first packet).
+                    let (_, batch_time_us) =
+                        measure_us!(self.extend_batch(receive_packet_results.deserialized_packets));
                     self.timing_metrics.update(|timing_metrics| {
-                        saturating_add_assign!(timing_metrics.buffer_time_us, buffer_time_us);
+                        saturating_add_assign!(timing_metrics.batch_time_us, batch_time_us);
                     });
                 } else {
                     self.count_metrics.update(|count_metrics| {
@@ -496,12 +528,27 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
         true
     }
 
-    fn buffer_packets(&mut self, packets: Vec<ImmutableDeserializedPacket>) {
+    fn extend_batch(&mut self, packets: Vec<ImmutableDeserializedPacket>) {
+        // If this is the first packet in the batch, set the
+        // start timestamp for the batch.
+        if self.batch.is_empty() {
+            self.batch_start = Instant::now();
+        }
+        self.batch.extend(packets);
+    }
+
+    fn buffer_packets(
+        bank_forks: &Arc<RwLock<BankForks>>,
+        container: &mut TransactionStateContainer,
+        transaction_id_generator: &mut TransactionIdGenerator,
+        count_metrics: &mut SchedulerCountMetrics,
+        packets: impl Iterator<Item = ImmutableDeserializedPacket>,
+    ) {
         // Convert to Arcs
         let packets: Vec<_> = packets.into_iter().map(Arc::new).collect();
         // Sanitize packets, generate IDs, and insert into the container.
         let (root_bank, working_bank) = {
-            let bank_forks = self.bank_forks.read().unwrap();
+            let bank_forks = bank_forks.read().unwrap();
             let root_bank = bank_forks.root_bank();
             let working_bank = bank_forks.working_bank();
             (root_bank, working_bank)
@@ -584,9 +631,17 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
                     .zip(fee_budget_limits_vec.drain(..))
                     .zip(check_results)
                     .filter(|(_, check_result)| check_result.is_ok())
+                    .filter(|((((_, tx), _), _), _)| {
+                        Consumer::check_fee_payer_unlocked(
+                            &working_bank,
+                            tx.message(),
+                            &mut error_counts,
+                        )
+                        .is_ok()
+                    })
             {
                 saturating_add_assign!(post_transaction_check_count, 1);
-                let transaction_id = self.transaction_id_generator.next();
+                let transaction_id = transaction_id_generator.next();
 
                 let (priority, cost) = Self::calculate_priority_and_cost(
                     &transaction,
@@ -598,7 +653,7 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
                     max_age,
                 };
 
-                if self.container.insert_new_transaction(
+                if container.insert_new_transaction(
                     transaction_id,
                     transaction_ttl,
                     packet,
@@ -617,7 +672,7 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
             let num_dropped_on_transaction_checks =
                 post_lock_validation_count.saturating_sub(post_transaction_check_count);
 
-            self.count_metrics.update(|count_metrics| {
+            count_metrics.update(|count_metrics| {
                 saturating_add_assign!(
                     count_metrics.num_dropped_on_capacity,
                     num_dropped_on_capacity
@@ -657,7 +712,7 @@ impl<T: LikeClusterInfo> SchedulerController<T> {
     /// from user input. They should never be zero.
     /// Any difference in the prioritization is negligible for
     /// the current transaction costs.
-    pub(crate) fn calculate_priority_and_cost(
+    fn calculate_priority_and_cost(
         transaction: &SanitizedTransaction,
         fee_budget_limits: &FeeBudgetLimits,
         bank: &Bank,
@@ -714,8 +769,10 @@ mod tests {
         crate::{
             banking_stage::{
                 consumer::TARGET_NUM_TRANSACTIONS_PER_BATCH,
+                packet_deserializer::PacketDeserializer,
                 scheduler_messages::{ConsumeWork, FinishedConsumeWork, TransactionBatchId},
                 tests::create_slow_genesis_config,
+                transaction_scheduler::prio_graph_scheduler::PrioGraphScheduler,
             },
             banking_trace::BankingPacketBatch,
             sigverify::SigverifyTracerPacketStats,
@@ -758,7 +815,12 @@ mod tests {
         finished_consume_work_sender: Sender<FinishedConsumeWork>,
     }
 
-    fn create_test_frame(num_threads: usize) -> (TestFrame, SchedulerController<Arc<ClusterInfo>>) {
+    fn create_test_frame(
+        num_threads: usize,
+    ) -> (
+        TestFrame,
+        SchedulerController<Arc<ClusterInfo>, PrioGraphScheduler>,
+    ) {
         let GenesisConfigInfo {
             mut genesis_config,
             mint_keypair,
@@ -806,9 +868,10 @@ mod tests {
             decision_maker,
             packet_deserializer,
             bank_forks,
-            GreedyScheduler::new(consume_work_senders, finished_consume_work_receiver),
+            PrioGraphScheduler::new(consume_work_senders, finished_consume_work_receiver),
             vec![], // no actual workers with metrics to report, this can be empty
             None,
+            Duration::from_millis(0),
         );
 
         (test_frame, scheduler_controller)
@@ -853,7 +916,7 @@ mod tests {
     // In the tests, the decision will not become stale, so it is more convenient
     // to receive first and then schedule.
     fn test_receive_then_schedule(
-        scheduler_controller: &mut SchedulerController<Arc<ClusterInfo>>,
+        scheduler_controller: &mut SchedulerController<Arc<ClusterInfo>, impl Scheduler>,
     ) {
         let decision = scheduler_controller
             .decision_maker

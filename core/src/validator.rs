@@ -5,6 +5,7 @@ use {
     crate::{
         accounts_hash_verifier::AccountsHashVerifier,
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
+        banking_stage::DEFAULT_BATCH_INTERVAL,
         banking_trace::{self, BankingTracer, TraceError},
         cache_block_meta_service::{CacheBlockMetaSender, CacheBlockMetaService},
         cluster_info_vote_listener::VoteTracker,
@@ -14,7 +15,6 @@ use {
             tower_storage::{NullTowerStorage, TowerStorage},
             ExternalRootSource, Tower,
         },
-        p3::P3_SOCKET_DEFAULT,
         poh_timing_report_service::PohTimingReportService,
         proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         repair::{
@@ -139,10 +139,9 @@ use {
     solana_wen_restart::wen_restart::{wait_for_wen_restart, WenRestartConfig},
     std::{
         collections::{HashMap, HashSet},
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        net::SocketAddr,
         num::NonZeroUsize,
         path::{Path, PathBuf},
-        str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, RwLock,
@@ -197,6 +196,7 @@ pub enum BlockProductionMethod {
     ThreadLocalMultiIterator,
     #[default]
     CentralScheduler,
+    CentralSchedulerGreedy,
 }
 
 impl BlockProductionMethod {
@@ -300,8 +300,7 @@ pub struct ValidatorConfig {
     pub shred_retransmit_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     pub tip_manager_config: TipManagerConfig,
     pub preallocated_bundle_cost: u64,
-    // p3
-    pub p3_socket: SocketAddr,
+    pub batch_interval: Duration,
 }
 
 impl Default for ValidatorConfig {
@@ -380,7 +379,7 @@ impl Default for ValidatorConfig {
             shred_retransmit_receiver_address: Arc::new(RwLock::new(None)),
             tip_manager_config: TipManagerConfig::default(),
             preallocated_bundle_cost: u64::default(),
-            p3_socket: SocketAddr::from_str(P3_SOCKET_DEFAULT).expect("p3 socket"),
+            batch_interval: DEFAULT_BATCH_INTERVAL,
         }
     }
 }
@@ -398,7 +397,6 @@ impl ValidatorConfig {
                 .expect("thread count is non-zero"),
             tvu_shred_sigverify_threads: NonZeroUsize::new(get_thread_count())
                 .expect("thread count is non-zero"),
-            p3_socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             ..Self::default()
         }
     }
@@ -1534,7 +1532,7 @@ impl Validator {
             config.tip_manager_config.clone(),
             config.shred_receiver_address.clone(),
             config.preallocated_bundle_cost,
-            config.p3_socket,
+            config.batch_interval,
         );
 
         datapoint_info!(

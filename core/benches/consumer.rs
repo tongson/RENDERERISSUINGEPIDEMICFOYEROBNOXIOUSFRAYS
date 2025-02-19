@@ -7,9 +7,9 @@ use {
         iter::IndexedParallelIterator,
         prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     },
-    solana_bundle::bundle_account_locker::BundleAccountLocker,
-    solana_core::banking_stage::{
-        committer::Committer, consumer::Consumer, qos_service::QosService,
+    solana_core::{
+        banking_stage::{committer::Committer, consumer::Consumer, qos_service::QosService},
+        bundle_stage::bundle_account_locker::BundleAccountLocker,
     },
     solana_ledger::{
         blockstore::Blockstore,
@@ -175,6 +175,7 @@ fn bench_process_and_record_transactions(bencher: &mut Bencher, batch_size: usiz
                 &bank,
                 transaction_iter.next().unwrap(),
                 0,
+                &|_| 0,
             );
             assert!(summary
                 .execute_and_commit_transactions_output

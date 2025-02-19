@@ -184,7 +184,7 @@ impl P3Quic {
             }
 
             // Check if we need to update staked nodes.
-            if self.staked_nodes_last_update.elapsed() >= STAKED_NODES_UPDATE_INTERVAL {
+            if now - self.staked_nodes_last_update >= STAKED_NODES_UPDATE_INTERVAL {
                 let start = Instant::now();
                 self.update_staked_nodes();
                 saturating_add_assign!(
@@ -217,7 +217,8 @@ impl P3Quic {
     }
 
     fn update_staked_nodes(&mut self) {
-        let bank = self.poh_recorder.read().unwrap().latest_bank();
+        let bank = self.poh_recorder.read().unwrap().get_poh_recorder_bank();
+        let bank = bank.bank();
 
         // Load the lockup pool account.
         let Some(pool) = bank.get_account(&POOL_KEY) else {
@@ -234,28 +235,34 @@ impl P3Quic {
         };
 
         // Setup a new staked nodes map.
-        let stakes: HashMap<_, _> = pool
+        let stakes = pool
             .entries
             .iter()
             .take_while(|entry| entry.lockup != Pubkey::default())
             .clone()
             .filter(|entry| entry.metadata != [0; 32])
             .map(|entry| (Pubkey::new_from_array(entry.metadata), entry.amount))
-            .collect();
+            .fold(
+                HashMap::with_capacity(pool.entries_len),
+                |mut map, (key, stake)| {
+                    *map.entry(key).or_default() += stake;
+
+                    map
+                },
+            );
         let stakes = Arc::new(stakes);
 
         // Swap the old for the new.
-        let mut staked_nodes = self.staked_nodes.write().unwrap();
-        *staked_nodes = StakedNodes::new(stakes.clone(), HashMap::default());
+        *self.staked_nodes.write().unwrap() = StakedNodes::new(stakes.clone(), HashMap::default());
 
         // Purge all connections where their stake no longer matches.
         let connection_table_l = self.staked_connection_table.lock().unwrap();
         for connection in connection_table_l.table().values().flatten() {
             match connection.peer_type {
                 ConnectionPeerType::Staked(stake) => {
-                    if staked_nodes
-                        .get_node_stake(&connection.identity)
-                        .map_or(true, |connection_stake| connection_stake != stake)
+                    if stakes
+                        .get(&connection.identity)
+                        .map_or(true, |connection_stake| connection_stake != &stake)
                     {
                         info!(
                             "Purging connection due to stake; identity={}",

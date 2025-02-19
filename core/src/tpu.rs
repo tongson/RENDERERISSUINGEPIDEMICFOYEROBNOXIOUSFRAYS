@@ -12,7 +12,6 @@ use {
             VerifiedVoteSender, VoteTracker,
         },
         fetch_stage::FetchStage,
-        p3::P3,
         p3_quic::P3Quic,
         proxy::{
             block_engine_stage::{BlockBuilderFeeInfo, BlockEngineConfig, BlockEngineStage},
@@ -40,6 +39,7 @@ use {
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{
+        bank::Bank,
         bank_forks::BankForks,
         prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::{ReplayVoteReceiver, ReplayVoteSender},
@@ -80,6 +80,20 @@ pub struct TpuSockets {
     pub transactions_forwards_quic: Vec<UdpSocket>,
 }
 
+/// For the first `reserved_ticks` ticks of a bank, the preallocated_bundle_cost is subtracted
+/// from the Bank's block cost limit.
+fn calculate_block_cost_limit_reservation(
+    bank: &Bank,
+    reserved_ticks: u64,
+    preallocated_bundle_cost: u64,
+) -> u64 {
+    if bank.tick_height() % bank.ticks_per_slot() < reserved_ticks {
+        preallocated_bundle_cost
+    } else {
+        0
+    }
+}
+
 pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
@@ -95,8 +109,7 @@ pub struct Tpu {
     relayer_stage: RelayerStage,
     block_engine_stage: BlockEngineStage,
     fetch_stage_manager: FetchStageManager,
-    jito_bundle_stage: BundleStage,
-    p3: std::thread::JoinHandle<()>,
+    bundle_stage: BundleStage,
     p3_quic: std::thread::JoinHandle<()>,
 }
 
@@ -144,7 +157,7 @@ impl Tpu {
         tip_manager_config: TipManagerConfig,
         shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
         preallocated_bundle_cost: u64,
-        p3_socket: SocketAddr,
+        batch_interval: Duration,
     ) -> (Self, Vec<Arc<dyn NotifyKeyUpdate + Sync + Send>>) {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -268,7 +281,6 @@ impl Tpu {
         );
 
         // Launch paladin threads.
-        let p3 = P3::spawn(exit.clone(), packet_sender.clone(), p3_socket);
         let (p3_quic, p3_quic_key_updaters) = P3Quic::spawn(
             exit.clone(),
             packet_sender.clone(),
@@ -319,6 +331,15 @@ impl Tpu {
         let bundle_account_locker = BundleAccountLocker::default();
 
         // The tip program can't be used in BankingStage to avoid someone from stealing tips mid-slot.
+        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
+        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
+        let reserved_ticks = poh_recorder
+            .read()
+            .unwrap()
+            .ticks_per_slot()
+            .saturating_mul(8)
+            .saturating_div(10);
+
         let mut blacklisted_accounts = HashSet::new();
         blacklisted_accounts.insert(tip_manager.tip_payment_program_id());
         let banking_stage = BankingStage::new(
@@ -337,20 +358,27 @@ impl Tpu {
             enable_block_production_forwarding,
             blacklisted_accounts,
             bundle_account_locker.clone(),
+            move |bank| {
+                calculate_block_cost_limit_reservation(
+                    bank,
+                    reserved_ticks,
+                    preallocated_bundle_cost,
+                )
+            },
+            batch_interval,
         );
 
-        let jito_bundle_stage = BundleStage::new(
+        let bundle_stage = BundleStage::new(
             cluster_info,
             poh_recorder,
             bundle_receiver,
-            transaction_status_sender.clone(),
-            replay_vote_sender.clone(),
+            transaction_status_sender,
+            replay_vote_sender,
             log_messages_bytes_limit,
             exit.clone(),
-            tip_manager.clone(),
-            bundle_account_locker.clone(),
+            tip_manager,
+            bundle_account_locker,
             &block_builder_fee_info,
-            preallocated_bundle_cost,
             prioritization_fee_cache,
         );
 
@@ -397,8 +425,7 @@ impl Tpu {
                 block_engine_stage,
                 relayer_stage,
                 fetch_stage_manager,
-                jito_bundle_stage,
-                p3,
+                bundle_stage,
                 p3_quic,
             },
             [key_updater, forwards_key_updater]
@@ -419,11 +446,10 @@ impl Tpu {
             self.staked_nodes_updater_service.join(),
             self.tpu_quic_t.join(),
             self.tpu_forwards_quic_t.join(),
-            self.jito_bundle_stage.join(),
+            self.bundle_stage.join(),
             self.relayer_stage.join(),
             self.block_engine_stage.join(),
             self.fetch_stage_manager.join(),
-            self.p3.join(),
             self.p3_quic.join(),
         ];
         let broadcast_result = self.broadcast_stage.join();
@@ -443,5 +469,50 @@ impl Tpu {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use {
+        super::calculate_block_cost_limit_reservation,
+        solana_ledger::genesis_utils::create_genesis_config, solana_runtime::bank::Bank,
+        solana_sdk::pubkey::Pubkey, std::sync::Arc,
+    };
+
+    #[test]
+    fn test_calculate_block_cost_limit_reservation() {
+        const BUNDLE_BLOCK_COST_LIMITS_RESERVATION: u64 = 100;
+        const RESERVED_TICKS: u64 = 5;
+        let genesis_config_info = create_genesis_config(100);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config_info.genesis_config));
+
+        for _ in 0..genesis_config_info.genesis_config.ticks_per_slot {
+            bank.register_default_tick_for_test();
+        }
+        assert!(bank.is_complete());
+        bank.freeze();
+        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &Pubkey::default(), 1));
+
+        // wait for reservation to be over
+        (0..RESERVED_TICKS).for_each(|_| {
+            assert_eq!(
+                calculate_block_cost_limit_reservation(
+                    &bank1,
+                    RESERVED_TICKS,
+                    BUNDLE_BLOCK_COST_LIMITS_RESERVATION,
+                ),
+                BUNDLE_BLOCK_COST_LIMITS_RESERVATION
+            );
+            bank1.register_default_tick_for_test();
+        });
+        assert_eq!(
+            calculate_block_cost_limit_reservation(
+                &bank1,
+                RESERVED_TICKS,
+                BUNDLE_BLOCK_COST_LIMITS_RESERVATION,
+            ),
+            0
+        );
     }
 }

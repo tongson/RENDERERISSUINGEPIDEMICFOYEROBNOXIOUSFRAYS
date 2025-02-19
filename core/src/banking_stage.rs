@@ -20,8 +20,8 @@ use {
             consume_worker::ConsumeWorker,
             packet_deserializer::PacketDeserializer,
             transaction_scheduler::{
-                greedy_scheduler::GreedyScheduler, scheduler_controller::SchedulerController,
-                scheduler_error::SchedulerError,
+                prio_graph_scheduler::PrioGraphScheduler,
+                scheduler_controller::SchedulerController, scheduler_error::SchedulerError,
             },
         },
         banking_trace::BankingPacketReceiver,
@@ -38,7 +38,7 @@ use {
     solana_perf::{data_budget::DataBudget, packet::PACKETS_PER_BATCH},
     solana_poh::poh_recorder::{PohRecorder, TransactionRecorder},
     solana_runtime::{
-        bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
+        bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
     solana_sdk::{pubkey::Pubkey, timing::AtomicInterval},
@@ -54,6 +54,7 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
+    transaction_scheduler::greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
 };
 
 // Below modules are pub to allow use by banking_stage bench
@@ -77,10 +78,12 @@ pub(crate) mod packet_filter;
 mod packet_receiver;
 mod read_write_account_set;
 mod scheduler_messages;
-pub(crate) mod transaction_scheduler;
+mod transaction_scheduler;
 
 // Fixed thread size seems to be fastest on GCP setup
 pub const NUM_THREADS: u32 = 6;
+
+pub const DEFAULT_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 const TOTAL_BUFFERED_PACKETS: usize = 100_000;
 
@@ -365,6 +368,9 @@ impl BankingStage {
         enable_forwarding: bool,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
+        // callback function for compute space reservation for BundleStage
+        block_cost_limit_block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64 + Clone + Send + 'static,
+        batch_interval: Duration,
     ) -> Self {
         Self::new_num_threads(
             block_production_method,
@@ -383,6 +389,8 @@ impl BankingStage {
             enable_forwarding,
             blacklisted_accounts,
             bundle_account_locker,
+            block_cost_limit_block_cost_limit_reservation_cb,
+            batch_interval,
         )
     }
 
@@ -404,6 +412,8 @@ impl BankingStage {
         enable_forwarding: bool,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
+        block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64 + Clone + Send + 'static,
+        batch_interval: Duration,
     ) -> Self {
         match block_production_method {
             BlockProductionMethod::ThreadLocalMultiIterator => {
@@ -422,25 +432,36 @@ impl BankingStage {
                     prioritization_fee_cache,
                     blacklisted_accounts,
                     bundle_account_locker,
+                    block_cost_limit_reservation_cb,
                 )
             }
-            BlockProductionMethod::CentralScheduler => Self::new_central_scheduler(
-                cluster_info,
-                poh_recorder,
-                non_vote_receiver,
-                tpu_vote_receiver,
-                gossip_vote_receiver,
-                num_threads,
-                transaction_status_sender,
-                replay_vote_sender,
-                log_messages_bytes_limit,
-                connection_cache,
-                bank_forks,
-                prioritization_fee_cache,
-                enable_forwarding,
-                blacklisted_accounts,
-                bundle_account_locker,
-            ),
+            BlockProductionMethod::CentralScheduler
+            | BlockProductionMethod::CentralSchedulerGreedy => {
+                let use_greedy_scheduler = matches!(
+                    block_production_method,
+                    BlockProductionMethod::CentralSchedulerGreedy
+                );
+                Self::new_central_scheduler(
+                    use_greedy_scheduler,
+                    cluster_info,
+                    poh_recorder,
+                    non_vote_receiver,
+                    tpu_vote_receiver,
+                    gossip_vote_receiver,
+                    num_threads,
+                    transaction_status_sender,
+                    replay_vote_sender,
+                    log_messages_bytes_limit,
+                    connection_cache,
+                    bank_forks,
+                    prioritization_fee_cache,
+                    enable_forwarding,
+                    blacklisted_accounts,
+                    bundle_account_locker,
+                    block_cost_limit_reservation_cb,
+                    batch_interval,
+                )
+            }
         }
     }
 
@@ -460,6 +481,7 @@ impl BankingStage {
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
+        block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64 + Clone + Send + 'static,
     ) -> Self {
         assert!(num_threads >= MIN_TOTAL_THREADS);
         // Single thread to generate entries from many banks.
@@ -528,6 +550,7 @@ impl BankingStage {
                     unprocessed_transaction_storage,
                     blacklisted_accounts.clone(),
                     bundle_account_locker.clone(),
+                    block_cost_limit_reservation_cb.clone(),
                 )
             })
             .collect();
@@ -536,6 +559,7 @@ impl BankingStage {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_central_scheduler(
+        use_greedy_scheduler: bool,
         cluster_info: &impl LikeClusterInfo,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         non_vote_receiver: BankingPacketReceiver,
@@ -551,6 +575,8 @@ impl BankingStage {
         enable_forwarding: bool,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
+        block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64 + Clone + Send + 'static,
+        batch_interval: Duration,
     ) -> Self {
         assert!(num_threads >= MIN_TOTAL_THREADS);
         // Single thread to generate entries from many banks.
@@ -599,6 +625,7 @@ impl BankingStage {
                 ),
                 blacklisted_accounts.clone(),
                 bundle_account_locker.clone(),
+                block_cost_limit_reservation_cb.clone(),
             ));
         }
 
@@ -628,11 +655,12 @@ impl BankingStage {
             );
 
             worker_metrics.push(consume_worker.metrics_handle());
+            let cb = block_cost_limit_reservation_cb.clone();
             bank_thread_hdls.push(
                 Builder::new()
                     .name(format!("solCoWorker{id:02}"))
                     .spawn(move || {
-                        let _ = consume_worker.run();
+                        let _ = consume_worker.run(cb);
                     })
                     .unwrap(),
             )
@@ -649,28 +677,65 @@ impl BankingStage {
         });
 
         // Spawn the central scheduler thread
-        bank_thread_hdls.push({
-            let packet_deserializer = PacketDeserializer::new(non_vote_receiver);
-            let scheduler = GreedyScheduler::new(work_senders, finished_work_receiver);
-            let scheduler_controller = SchedulerController::new(
-                decision_maker.clone(),
-                packet_deserializer,
-                bank_forks,
-                scheduler,
-                worker_metrics,
-                forwarder,
+        let packet_deserializer = PacketDeserializer::new(non_vote_receiver);
+        if use_greedy_scheduler {
+            bank_thread_hdls.push(
+                Builder::new()
+                    .name("solBnkTxSched".to_string())
+                    .spawn(move || {
+                        let scheduler = GreedyScheduler::new(
+                            work_senders,
+                            finished_work_receiver,
+                            GreedySchedulerConfig::default(),
+                        );
+                        let scheduler_controller = SchedulerController::new(
+                            decision_maker.clone(),
+                            packet_deserializer,
+                            bank_forks,
+                            scheduler,
+                            worker_metrics,
+                            forwarder,
+                            batch_interval,
+                        );
+
+                        match scheduler_controller.run() {
+                            Ok(_) => {}
+                            Err(SchedulerError::DisconnectedRecvChannel(_)) => {}
+                            Err(SchedulerError::DisconnectedSendChannel(_)) => {
+                                warn!("Unexpected worker disconnect from scheduler")
+                            }
+                        }
+                    })
+                    .unwrap(),
             );
-            Builder::new()
-                .name("solBnkTxSched".to_string())
-                .spawn(move || match scheduler_controller.run() {
-                    Ok(_) => {}
-                    Err(SchedulerError::DisconnectedRecvChannel(_)) => {}
-                    Err(SchedulerError::DisconnectedSendChannel(_)) => {
-                        warn!("Unexpected worker disconnect from scheduler")
-                    }
-                })
-                .unwrap()
-        });
+        } else {
+            bank_thread_hdls.push(
+                Builder::new()
+                    .name("solBnkTxSched".to_string())
+                    .spawn(move || {
+                        let scheduler =
+                            PrioGraphScheduler::new(work_senders, finished_work_receiver);
+                        let scheduler_controller = SchedulerController::new(
+                            decision_maker.clone(),
+                            packet_deserializer,
+                            bank_forks,
+                            scheduler,
+                            worker_metrics,
+                            forwarder,
+                            batch_interval,
+                        );
+
+                        match scheduler_controller.run() {
+                            Ok(_) => {}
+                            Err(SchedulerError::DisconnectedRecvChannel(_)) => {}
+                            Err(SchedulerError::DisconnectedSendChannel(_)) => {
+                                warn!("Unexpected worker disconnect from scheduler")
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
 
         Self { bank_thread_hdls }
     }
@@ -687,6 +752,7 @@ impl BankingStage {
         unprocessed_transaction_storage: UnprocessedTransactionStorage,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
+        block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64 + Clone + Send + 'static,
     ) -> JoinHandle<()> {
         let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
         let consumer = Consumer::new(
@@ -708,6 +774,7 @@ impl BankingStage {
                     &consumer,
                     id,
                     unprocessed_transaction_storage,
+                    block_cost_limit_reservation_cb,
                 )
             })
             .unwrap()
@@ -722,6 +789,7 @@ impl BankingStage {
         banking_stage_stats: &BankingStageStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
         tracer_packet_stats: &mut TracerPacketStats,
+        block_cost_limit_reservation_cb: &impl Fn(&Bank) -> u64,
     ) {
         if unprocessed_transaction_storage.should_not_process() {
             return;
@@ -747,6 +815,7 @@ impl BankingStage {
                         unprocessed_transaction_storage,
                         banking_stage_stats,
                         slot_metrics_tracker,
+                        block_cost_limit_reservation_cb
                     ));
                 slot_metrics_tracker
                     .increment_consume_buffered_packets_us(consume_buffered_packets_us);
@@ -787,6 +856,7 @@ impl BankingStage {
         consumer: &Consumer,
         id: u32,
         mut unprocessed_transaction_storage: UnprocessedTransactionStorage,
+        block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64,
     ) {
         let mut banking_stage_stats = BankingStageStats::new(id);
         let mut tracer_packet_stats = TracerPacketStats::new(id);
@@ -806,6 +876,7 @@ impl BankingStage {
                     &banking_stage_stats,
                     &mut slot_metrics_tracker,
                     &mut tracer_packet_stats,
+                    &block_cost_limit_reservation_cb
                 ));
                 slot_metrics_tracker
                     .increment_process_buffered_packets_us(process_buffered_packets_us);
@@ -939,6 +1010,8 @@ mod tests {
                 false,
                 HashSet::default(),
                 BundleAccountLocker::default(),
+                |_| 0,
+                Duration::from_millis(50),
             );
             drop(non_vote_sender);
             drop(tpu_vote_sender);
@@ -997,6 +1070,8 @@ mod tests {
                 false,
                 HashSet::default(),
                 BundleAccountLocker::default(),
+                |_| 0,
+                Duration::from_millis(50),
             );
             trace!("sending bank");
             drop(non_vote_sender);
@@ -1084,6 +1159,8 @@ mod tests {
                 false,
                 HashSet::default(),
                 BundleAccountLocker::default(),
+                |_| 0,
+                Duration::from_millis(50),
             );
 
             // fund another account so we can send 2 good transactions in a single batch.
@@ -1261,6 +1338,7 @@ mod tests {
                     &Arc::new(PrioritizationFeeCache::new(0u64)),
                     HashSet::default(),
                     BundleAccountLocker::default(),
+                    |_| 0,
                 );
 
                 // wait for banking_stage to eat the packets
@@ -1464,6 +1542,8 @@ mod tests {
                 false,
                 HashSet::default(),
                 BundleAccountLocker::default(),
+                |_| 0,
+                Duration::from_millis(50),
             );
 
             let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();

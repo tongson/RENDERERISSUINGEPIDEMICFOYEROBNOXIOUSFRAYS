@@ -60,9 +60,6 @@ pub enum BundleExecutionError {
     #[error("Tip payment error {0}")]
     TipError(#[from] TipError),
 
-    #[error("Tip was too low")]
-    TipTooLow,
-
     #[error("Bundle contained a front run")]
     FrontRun,
 }

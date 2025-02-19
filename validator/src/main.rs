@@ -31,9 +31,9 @@ use {
     },
     solana_clap_utils::input_parsers::{keypair_of, keypairs_of, pubkey_of, value_of, values_of},
     solana_core::{
+        banking_stage::DEFAULT_BATCH_INTERVAL,
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
-        p3::P3_SOCKET_DEFAULT,
         proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         system_monitor_service::SystemMonitorService,
         tip_manager::{TipDistributionAccountConfig, TipManagerConfig},
@@ -1610,10 +1610,12 @@ pub fn main() {
         trust_packets: matches.is_present("trust_relayer_packets"),
     };
 
-    let p3_socket = if matches.is_present("p3_socket") {
-        value_of(&matches, "p3_socket").expect("couldn't parse p3_socket")
+    let batch_interval = if matches.is_present("batch_interval_ms") {
+        Duration::from_millis(
+            value_of(&matches, "batch_interval_ms").expect("Couldn't parse batch_interval_ms"),
+        )
     } else {
-        SocketAddr::from_str(P3_SOCKET_DEFAULT).expect("couldn't parse p3_socket")
+        DEFAULT_BATCH_INTERVAL
     };
 
     let mut validator_config = ValidatorConfig {
@@ -1778,7 +1780,7 @@ pub fn main() {
         wen_restart_coordinator: value_t!(matches, "wen_restart_coordinator", Pubkey).ok(),
         preallocated_bundle_cost: value_of(&matches, "preallocated_bundle_cost")
             .expect("preallocated_bundle_cost set as default"),
-        p3_socket,
+        batch_interval,
         ..ValidatorConfig::default()
     };
 
@@ -2427,6 +2429,16 @@ fn tip_manager_config_from_matches(
 ) -> TipManagerConfig {
     TipManagerConfig {
         funnel: pubkey_of(matches, "funnel"),
+        rewards_split: match (value_t!(matches, "rewards_split_minimum_lamports", u64), value_t!(matches, "rewards_split_bp", u16)) {
+            (Ok(minimum_lamports), Ok(rewards_split_bp)) => {
+                assert!(minimum_lamports >= 10u64.pow(9), "`--rewards-split-minimum-lamports` should be at least 1 SOL (1e9 lamports)");
+                assert!(rewards_split_bp <= 10_000, "`--rewards-split-bp` should be in basis points (0..10_000)");
+
+                Some((minimum_lamports, rewards_split_bp))
+            }
+            (Err(_), Err(_)) => None,
+            _ => panic!("`rewards_split_minimum_lamports` and `rewards_split_bp` must both be set to split block rewards"),
+        },
         tip_payment_program_id: pubkey_of(matches, "tip_payment_program_pubkey").unwrap_or_else(
             || {
                 if !voting_disabled {

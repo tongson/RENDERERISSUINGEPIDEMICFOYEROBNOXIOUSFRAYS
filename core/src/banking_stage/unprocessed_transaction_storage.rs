@@ -30,6 +30,7 @@ use {
     solana_runtime::bank::Bank,
     solana_sdk::{
         clock::{Slot, FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET},
+        feature_set,
         hash::Hash,
         pubkey::Pubkey,
         saturating_add_assign,
@@ -1375,7 +1376,7 @@ impl BundleStorage {
                         debug!("bundle={} lock error", sanitized_bundle.bundle_id);
                     }
                     // NB: Tip cutoff is static & front-runs will never succeed.
-                    Err(BundleExecutionError::TipTooLow | BundleExecutionError::FrontRun) => {}
+                    Err(BundleExecutionError::FrontRun) => {}
                 },
             );
 
@@ -1400,6 +1401,10 @@ impl BundleStorage {
 
         let mut sanitized_bundles = Vec::new();
 
+        let move_precompile_verification_to_svm = bank
+            .feature_set
+            .is_active(&feature_set::move_precompile_verification_to_svm::id());
+
         // on new slot, drain anything that was buffered from last slot
         if bank.slot() != self.last_update_slot {
             sanitized_bundles.extend(
@@ -1410,6 +1415,7 @@ impl BundleStorage {
                             &bank,
                             blacklisted_accounts,
                             &mut error_metrics,
+                            move_precompile_verification_to_svm,
                         );
                         bundle_stage_leader_metrics
                             .bundle_stage_metrics_tracker()
@@ -1438,6 +1444,7 @@ impl BundleStorage {
                     &bank,
                     blacklisted_accounts,
                     &mut error_metrics,
+                    move_precompile_verification_to_svm,
                 );
                 bundle_stage_leader_metrics
                     .bundle_stage_metrics_tracker()

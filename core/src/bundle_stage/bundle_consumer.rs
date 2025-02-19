@@ -9,7 +9,6 @@ use {
         },
         bundle_stage::{
             bundle_account_locker::{BundleAccountLocker, LockedBundle},
-            bundle_reserved_space_manager::BundleReservedSpaceManager,
             bundle_stage_leader_metrics::BundleStageLeaderMetrics,
             committer::Committer,
         },
@@ -17,11 +16,9 @@ use {
         proxy::block_engine_stage::BlockBuilderFeeInfo,
         tip_manager::TipManager,
     },
-    itertools::{izip, Itertools},
+    itertools::Itertools,
     solana_bundle::{
-        bundle_execution::{
-            load_and_execute_bundle, BundleExecutionMetrics, LoadAndExecuteBundleOutput,
-        },
+        bundle_execution::{load_and_execute_bundle, BundleExecutionMetrics},
         BundleExecutionError, BundleExecutionResult, SanitizedBundle, TipError,
     },
     solana_cost_model::transaction_cost::TransactionCost,
@@ -32,7 +29,7 @@ use {
     solana_sdk::{
         clock::{Slot, MAX_PROCESSING_AGE},
         pubkey::Pubkey,
-        transaction::{self, SanitizedTransaction, TransactionError},
+        transaction::{self, SanitizedTransaction},
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
@@ -53,8 +50,6 @@ pub struct ExecuteRecordCommitResult {
     execution_metrics: BundleExecutionMetrics,
     execute_and_commit_timings: LeaderExecuteAndCommitTimings,
     transaction_error_counter: TransactionErrorMetrics,
-    cu_used: u64,
-    lamports_paid: u64,
 }
 
 pub struct BundleConsumer {
@@ -77,8 +72,6 @@ pub struct BundleConsumer {
     max_bundle_retry_duration: Duration,
 
     cluster_info: Arc<ClusterInfo>,
-
-    reserved_space: BundleReservedSpaceManager,
 }
 
 impl BundleConsumer {
@@ -93,7 +86,6 @@ impl BundleConsumer {
         block_builder_fee_info: Arc<Mutex<BlockBuilderFeeInfo>>,
         max_bundle_retry_duration: Duration,
         cluster_info: Arc<ClusterInfo>,
-        reserved_space: BundleReservedSpaceManager,
     ) -> Self {
         let blacklisted_accounts = HashSet::from_iter([tip_manager.tip_payment_program_id()]);
         Self {
@@ -109,7 +101,6 @@ impl BundleConsumer {
             block_builder_fee_info,
             max_bundle_retry_duration,
             cluster_info,
-            reserved_space,
         }
     }
 
@@ -136,8 +127,6 @@ impl BundleConsumer {
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
     ) {
-        self.reserved_space.tick(&bank_start.working_bank);
-
         let reached_end_of_slot = unprocessed_transaction_storage.process_bundles(
             bank_start.working_bank.clone(),
             bundle_stage_leader_metrics,
@@ -154,7 +143,6 @@ impl BundleConsumer {
                     &self.qos_service,
                     &self.log_messages_bytes_limit,
                     self.max_bundle_retry_duration,
-                    &self.reserved_space,
                     bundles,
                     bank_start,
                     bundle_stage_leader_metrics,
@@ -183,7 +171,6 @@ impl BundleConsumer {
         qos_service: &QosService,
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
-        reserved_space: &BundleReservedSpaceManager,
         bundles: &[(ImmutableDeserializedBundle, SanitizedBundle)],
         bank_start: &BankStart,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
@@ -220,11 +207,9 @@ impl BundleConsumer {
                             qos_service,
                             log_messages_bytes_limit,
                             max_bundle_retry_duration,
-                            reserved_space,
                             &locked_bundle,
                             bank_start,
                             bundle_stage_leader_metrics,
-                            Some(10u64.pow(6) / 10), // 0.1 lamports per CU
                         ));
                         bundle_stage_leader_metrics
                             .leader_slot_metrics_tracker()
@@ -261,11 +246,9 @@ impl BundleConsumer {
         qos_service: &QosService,
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
-        reserved_space: &BundleReservedSpaceManager,
         locked_bundle: &LockedBundle,
         bank_start: &BankStart,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
-        min_micro_lamports: Option<u64>,
     ) -> Result<(), BundleExecutionError> {
         if !Bank::should_bank_still_be_processing_txs(
             &bank_start.bank_creation_time,
@@ -277,7 +260,7 @@ impl BundleConsumer {
         if bank_start.working_bank.slot() != *last_tip_updated_slot
             && Self::bundle_touches_tip_pdas(
                 locked_bundle.sanitized_bundle(),
-                &tip_manager.get_tip_accounts(),
+                tip_manager.get_tip_accounts(),
             )
         {
             let start = Instant::now();
@@ -291,7 +274,6 @@ impl BundleConsumer {
                 qos_service,
                 log_messages_bytes_limit,
                 max_bundle_retry_duration,
-                reserved_space,
                 bank_start,
                 bundle_stage_leader_metrics,
             );
@@ -311,12 +293,9 @@ impl BundleConsumer {
             qos_service,
             log_messages_bytes_limit,
             max_bundle_retry_duration,
-            reserved_space,
             locked_bundle.sanitized_bundle(),
             bank_start,
             bundle_stage_leader_metrics,
-            tip_manager.get_tip_accounts(),
-            min_micro_lamports,
         )?;
 
         Ok(())
@@ -334,7 +313,6 @@ impl BundleConsumer {
         qos_service: &QosService,
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
-        reserved_space: &BundleReservedSpaceManager,
         bank_start: &BankStart,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
     ) -> Result<(), BundleExecutionError> {
@@ -363,12 +341,9 @@ impl BundleConsumer {
                 qos_service,
                 log_messages_bytes_limit,
                 max_bundle_retry_duration,
-                reserved_space,
                 locked_init_tip_programs_bundle.sanitized_bundle(),
                 bank_start,
                 bundle_stage_leader_metrics,
-                tip_manager.get_tip_accounts(),
-                None,
             )
             .map_err(|e| {
                 bundle_stage_leader_metrics
@@ -418,12 +393,9 @@ impl BundleConsumer {
                 qos_service,
                 log_messages_bytes_limit,
                 max_bundle_retry_duration,
-                reserved_space,
                 locked_tip_crank_bundle.sanitized_bundle(),
                 bank_start,
                 bundle_stage_leader_metrics,
-                tip_manager.get_tip_accounts(),
-                None,
             )
             .map_err(|e| {
                 bundle_stage_leader_metrics
@@ -449,26 +421,17 @@ impl BundleConsumer {
     /// Rolls back the reserved space if there's not enough blockspace for all transactions in the bundle.
     fn reserve_bundle_blockspace<'a>(
         qos_service: &QosService,
-        reserved_space: &BundleReservedSpaceManager,
         sanitized_bundle: &'a SanitizedBundle,
         bank: &Arc<Bank>,
     ) -> ReserveBundleBlockspaceResult<'a> {
-        let mut write_cost_tracker = bank.write_cost_tracker().unwrap();
-
-        // set the block cost limit to the original block cost limit, run the select + accumulate
-        // then reset back to the expected block cost limit. this allows bundle stage to potentially
-        // increase block_compute_limits, allocate the space, and reset the block_cost_limits to
-        // the reserved space without BankingStage racing to allocate this extra reserved space
-        write_cost_tracker.set_block_cost_limit(reserved_space.block_cost_limit());
         let (transaction_qos_cost_results, cost_model_throttled_transactions_count) = qos_service
             .select_and_accumulate_transaction_costs(
                 bank,
-                &mut write_cost_tracker,
                 &sanitized_bundle.transactions,
                 std::iter::repeat(Ok(())),
+                // bundle stage does not respect the cost model reservation
+                &|_| 0,
             );
-        write_cost_tracker.set_block_cost_limit(reserved_space.expected_block_cost_limits(bank));
-        drop(write_cost_tracker);
 
         // rollback all transaction costs if it can't fit and
         if transaction_qos_cost_results.iter().any(|c| c.is_err()) {
@@ -482,18 +445,16 @@ impl BundleConsumer {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_qos_and_execute_record_commit_bundle(
         committer: &Committer,
         recorder: &TransactionRecorder,
         qos_service: &QosService,
         log_messages_bytes_limit: &Option<usize>,
         max_bundle_retry_duration: Duration,
-        reserved_space: &BundleReservedSpaceManager,
         sanitized_bundle: &SanitizedBundle,
         bank_start: &BankStart,
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
-        tip_accounts: &HashSet<Pubkey>,
-        min_micro_lamports: Option<u64>,
     ) -> BundleExecutionResult<()> {
         debug!(
             "bundle: {} reserving blockspace for {} transactions",
@@ -506,7 +467,6 @@ impl BundleConsumer {
             cost_model_elapsed_us,
         ) = measure_us!(Self::reserve_bundle_blockspace(
             qos_service,
-            reserved_space,
             sanitized_bundle,
             &bank_start.working_bank
         )?);
@@ -523,9 +483,6 @@ impl BundleConsumer {
             max_bundle_retry_duration,
             sanitized_bundle,
             bank_start,
-            &transaction_qos_cost_results,
-            tip_accounts,
-            min_micro_lamports,
         ));
 
         bundle_stage_leader_metrics
@@ -574,26 +531,6 @@ impl BundleConsumer {
                 max_prioritization_fees: 0, // TODO (LB)
             });
 
-        // Update packing metrics.
-        let bundle_metrics = bundle_stage_leader_metrics.bundle_stage_metrics_tracker();
-
-        match result.result {
-            Ok(_) => {
-                bundle_metrics.increment_committed(1);
-                bundle_metrics.increment_committed_cu(result.cu_used);
-                bundle_metrics.increment_committed_lamports(result.lamports_paid);
-            }
-            Err(BundleExecutionError::TipTooLow) => {
-                bundle_metrics.increment_dropped(1);
-                bundle_metrics.increment_dropped_cu(result.cu_used);
-                bundle_metrics.increment_dropped_lamports(result.lamports_paid);
-            }
-            Err(_) => {
-                bundle_metrics.increment_reverted(1);
-                bundle_metrics.increment_reverted_cu(result.cu_used);
-            }
-        }
-
         match result.result {
             Ok(_) => {
                 QosService::remove_or_update_costs(
@@ -627,12 +564,6 @@ impl BundleConsumer {
         max_bundle_retry_duration: Duration,
         sanitized_bundle: &SanitizedBundle,
         bank_start: &BankStart,
-        transaction_qos_cost_results: &[Result<
-            TransactionCost<'_, SanitizedTransaction>,
-            TransactionError,
-        >],
-        tip_accounts: &HashSet<Pubkey>,
-        min_micro_lamports: Option<u64>,
     ) -> ExecuteRecordCommitResult {
         let transaction_status_sender_enabled = committer.transaction_status_sender_enabled();
 
@@ -668,14 +599,6 @@ impl BundleConsumer {
             bundle_execution_results.result().is_ok()
         );
 
-        let economics = Self::compute_cu_and_lamports(
-            tip_accounts,
-            bank_start,
-            transaction_qos_cost_results,
-            &bundle_execution_results,
-        );
-        let (cu_used, lamports_paid) = economics.unwrap_or_default();
-
         // don't commit bundle if failure executing any part of the bundle
         if let Err(e) = bundle_execution_results.result() {
             return ExecuteRecordCommitResult {
@@ -684,8 +607,6 @@ impl BundleConsumer {
                 execution_metrics,
                 execute_and_commit_timings,
                 transaction_error_counter,
-                cu_used,
-                lamports_paid,
             };
         }
 
@@ -707,30 +628,8 @@ impl BundleConsumer {
                 execution_metrics,
                 execute_and_commit_timings,
                 transaction_error_counter,
-                cu_used,
-                lamports_paid,
             };
         }
-
-        // Compute the bundles total CUs & lamports paid.
-        match economics {
-            Some((cu_used, lamports_paid)) => {
-                if let Some(min_micro_lamports) = min_micro_lamports {
-                    if lamports_paid * 10u64.pow(6) / cu_used < min_micro_lamports {
-                        return ExecuteRecordCommitResult {
-                            commit_transaction_details: vec![],
-                            result: Err(BundleExecutionError::TipTooLow),
-                            execution_metrics,
-                            execute_and_commit_timings,
-                            transaction_error_counter,
-                            cu_used,
-                            lamports_paid,
-                        };
-                    }
-                }
-            }
-            None => eprintln!("Failed to compute CU & lamports; this shouldn't be possible"),
-        };
 
         let (executed_batches, execution_results_to_transactions_us) =
             measure_us!(bundle_execution_results.executed_transaction_batches());
@@ -779,8 +678,6 @@ impl BundleConsumer {
                 execution_metrics,
                 execute_and_commit_timings,
                 transaction_error_counter,
-                cu_used,
-                lamports_paid,
             };
         }
 
@@ -819,8 +716,6 @@ impl BundleConsumer {
             execution_metrics,
             execute_and_commit_timings,
             transaction_error_counter,
-            cu_used,
-            lamports_paid,
         }
     }
 
@@ -833,58 +728,6 @@ impl BundleConsumer {
                 .any(|a| tip_pdas.contains(a))
         })
     }
-
-    fn compute_cu_and_lamports(
-        tip_accounts: &HashSet<Pubkey>,
-        bank_start: &BankStart,
-        transaction_qos_cost_results: &[Result<
-            TransactionCost<'_, SanitizedTransaction>,
-            TransactionError,
-        >],
-        bundle_execution_results: &LoadAndExecuteBundleOutput,
-    ) -> Option<(u64, u64)> {
-        let mut cu_used = 0u64;
-        let mut lamports_paid = 0u64;
-        for ((tx, execution, pre, post), cost) in bundle_execution_results
-            .bundle_transaction_results()
-            .iter()
-            .flat_map(|res| {
-                izip!(
-                    res.executed_transactions(),
-                    res.execution_results(),
-                    &res.pre_balance_info().native,
-                    &res.post_balance_info().0,
-                )
-            })
-            .zip(transaction_qos_cost_results)
-        {
-            // Compute the tip payments.
-            for (_, (pre, post)) in izip!(pre, post)
-                .enumerate()
-                .map(|(i, (pre, post))| (tx.message().account_keys().get(i).unwrap(), (pre, post)))
-                .filter(|(key, _)| tip_accounts.contains(key))
-            {
-                let tip = post.saturating_sub(*pre);
-                lamports_paid = lamports_paid.saturating_add(tip);
-            }
-
-            // Compute the TX base + priority fee.
-            let cost = cost.as_ref().ok()?;
-            let fee = bank_start.working_bank.get_fee_for_message(tx.message())?;
-            let total_cu = cost
-                .sum()
-                .saturating_add(execution.as_ref().ok()?.execution_details()?.executed_units);
-
-            lamports_paid = lamports_paid.saturating_add(fee);
-            cu_used = cu_used.saturating_add(total_cu);
-        }
-
-        if cu_used == 0 || lamports_paid == 0 {
-            return None;
-        }
-
-        Some((cu_used, lamports_paid))
-    }
 }
 
 #[cfg(test)]
@@ -894,7 +737,6 @@ mod tests {
             bundle_stage::{
                 bundle_account_locker::BundleAccountLocker, bundle_consumer::BundleConsumer,
                 bundle_packet_deserializer::BundlePacketDeserializer,
-                bundle_reserved_space_manager::BundleReservedSpaceManager,
                 bundle_stage_leader_metrics::BundleStageLeaderMetrics, committer::Committer,
                 QosService, UnprocessedTransactionStorage,
             },
@@ -908,7 +750,7 @@ mod tests {
         jito_tip_distribution::sdk::derive_tip_distribution_account_address,
         rand::{thread_rng, RngCore},
         solana_bundle::SanitizedBundle,
-        solana_cost_model::{block_cost_limits::MAX_BLOCK_UNITS, cost_model::CostModel},
+        solana_cost_model::cost_model::CostModel,
         solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_ledger::{
             blockstore::Blockstore, genesis_utils::create_genesis_config,
@@ -1139,6 +981,7 @@ mod tests {
             leader_schedule_cache,
             TipManagerConfig {
                 funnel,
+                rewards_split: None,
                 tip_payment_program_id: Pubkey::from_str(
                     "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt",
                 )
@@ -1214,16 +1057,6 @@ mod tests {
             block_builder_info,
             Duration::from_secs(10),
             cluster_info,
-            BundleReservedSpaceManager::new(
-                MAX_BLOCK_UNITS,
-                3_000_000,
-                poh_recorder
-                    .read()
-                    .unwrap()
-                    .ticks_per_slot()
-                    .saturating_mul(8)
-                    .saturating_div(10),
-            ),
         );
 
         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
@@ -1250,6 +1083,7 @@ mod tests {
                 &bank_start.working_bank,
                 &HashSet::default(),
                 &mut error_metrics,
+                false,
             )
             .unwrap();
 
@@ -1368,16 +1202,6 @@ mod tests {
             block_builder_info,
             Duration::from_secs(10),
             cluster_info.clone(),
-            BundleReservedSpaceManager::new(
-                MAX_BLOCK_UNITS,
-                3_000_000,
-                poh_recorder
-                    .read()
-                    .unwrap()
-                    .ticks_per_slot()
-                    .saturating_mul(8)
-                    .saturating_div(10),
-            ),
         );
 
         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
@@ -1411,6 +1235,7 @@ mod tests {
                 &bank_start.working_bank,
                 &HashSet::default(),
                 &mut error_metrics,
+                false,
             )
             .unwrap();
 
@@ -1544,12 +1369,6 @@ mod tests {
 
         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 
-        let reserved_ticks = bank.max_tick_height().saturating_mul(8).saturating_div(10);
-
-        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
-        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
-        let reserved_space =
-            BundleReservedSpaceManager::new(MAX_BLOCK_UNITS, 3_000_000, reserved_ticks);
         let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
         assert_matches!(
             BundleConsumer::handle_tip_programs(
@@ -1562,7 +1381,6 @@ mod tests {
                 &QosService::new(1),
                 &None,
                 Duration::from_secs(10),
-                &reserved_space,
                 &bank_start,
                 &mut bundle_stage_leader_metrics
             ),
@@ -1655,20 +1473,10 @@ mod tests {
             CostModel::calculate_cost(&sanitized_bundle.transactions[0], &bank.feature_set);
 
         let qos_service = QosService::new(1);
-        let reserved_ticks = bank.max_tick_height().saturating_mul(8).saturating_div(10);
-
-        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
-        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
-        let reserved_space =
-            BundleReservedSpaceManager::new(MAX_BLOCK_UNITS, 3_000_000, reserved_ticks);
-
-        assert!(BundleConsumer::reserve_bundle_blockspace(
-            &qos_service,
-            &reserved_space,
-            &sanitized_bundle,
-            &bank
-        )
-        .is_ok());
+        assert!(
+            BundleConsumer::reserve_bundle_blockspace(&qos_service, &sanitized_bundle, &bank)
+                .is_ok()
+        );
         assert_eq!(
             bank.read_cost_tracker().unwrap().block_cost(),
             transfer_cost.sum()
@@ -1708,30 +1516,12 @@ mod tests {
             .set_block_cost_limit(transfer_cost.sum());
 
         let qos_service = QosService::new(1);
-        let reserved_ticks = bank.max_tick_height().saturating_mul(8).saturating_div(10);
 
-        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
-        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
-        let reserved_space = BundleReservedSpaceManager::new(
-            bank.read_cost_tracker().unwrap().block_cost(),
-            50,
-            reserved_ticks,
+        assert!(
+            BundleConsumer::reserve_bundle_blockspace(&qos_service, &sanitized_bundle, &bank)
+                .is_err()
         );
-
-        assert!(BundleConsumer::reserve_bundle_blockspace(
-            &qos_service,
-            &reserved_space,
-            &sanitized_bundle,
-            &bank
-        )
-        .is_err());
+        // the block cost shall not be modified
         assert_eq!(bank.read_cost_tracker().unwrap().block_cost(), 0);
-        assert_eq!(
-            bank.read_cost_tracker().unwrap().block_cost_limit(),
-            bank.read_cost_tracker()
-                .unwrap()
-                .block_cost_limit()
-                .saturating_sub(50)
-        );
     }
 }
