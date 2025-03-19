@@ -190,7 +190,7 @@ impl BlockVerificationMethod {
     }
 }
 
-#[derive(Clone, EnumString, EnumVariantNames, Default, IntoStaticStr, Display)]
+#[derive(Clone, EnumString, EnumVariantNames, Default, IntoStaticStr, Display, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
 pub enum BlockProductionMethod {
     ThreadLocalMultiIterator,

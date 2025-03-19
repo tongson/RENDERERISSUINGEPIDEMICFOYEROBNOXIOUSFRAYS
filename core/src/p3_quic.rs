@@ -1,6 +1,6 @@
 use {
     crate::tpu::MAX_QUIC_CONNECTIONS_PER_PEER,
-    crossbeam_channel::RecvTimeoutError,
+    crossbeam_channel::{RecvError, TrySendError},
     paladin_lockup_program::state::LockupPool,
     solana_perf::packet::PacketBatch,
     solana_poh::poh_recorder::PohRecorder,
@@ -9,8 +9,11 @@ use {
         signature::Keypair,
     },
     solana_streamer::{
-        nonblocking::quic::{
-            ConnectionPeerType, ConnectionTable, DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
+        nonblocking::{
+            quic::{
+                ConnectionPeerType, ConnectionTable, DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
+            },
+            stream_throttle::StakedStreamLoadEMAArgs,
         },
         quic::{EndpointKeyUpdater, SpawnServerResult},
         streamer::StakedNodes,
@@ -32,11 +35,8 @@ const P3_MEV_SOCKET: &str = "0.0.0.0:4820";
 
 const MAX_STAKED_CONNECTIONS: usize = 256;
 const MAX_UNSTAKED_CONNECTIONS: usize = 0;
-/// This results in 100 streams per 100ms, i.e. 1000 global TPS. Users with less
-/// than 1% stake will be rounded up to 1 stream per 100ms.
-const MAX_STREAMS_PER_MS: u64 = 1;
 
-const STAKED_NODES_UPDATE_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
+const STAKED_NODES_UPDATE_INTERVAL: Duration = Duration::from_secs(900); // 15 minutes
 const POOL_KEY: Pubkey = solana_sdk::pubkey!("EJi4Rj2u1VXiLpKtaqeQh3w4XxAGLFqnAG1jCorSvVmg");
 
 pub(crate) struct P3Quic {
@@ -48,6 +48,7 @@ pub(crate) struct P3Quic {
     staked_nodes_last_update: Instant,
     poh_recorder: Arc<RwLock<PohRecorder>>,
     staked_connection_table: Arc<Mutex<ConnectionTable>>,
+    reg_packet_rx: crossbeam_channel::Receiver<PacketBatch>,
     mev_packet_rx: crossbeam_channel::Receiver<PacketBatch>,
     packet_tx: crossbeam_channel::Sender<PacketBatch>,
 
@@ -78,6 +79,7 @@ impl P3Quic {
             Arc::new(Mutex::new(ConnectionTable::new()));
 
         // Spawn the P3 QUIC server (regular).
+        let (reg_packet_tx, reg_packet_rx) = crossbeam_channel::unbounded();
         let SpawnServerResult {
             endpoints: _,
             thread: quic_server_regular,
@@ -88,17 +90,21 @@ impl P3Quic {
             socket_regular,
             keypair,
             // NB: Packets are verified using the usual TPU lane.
-            packet_tx.clone(),
+            reg_packet_tx,
             exit.clone(),
             MAX_QUIC_CONNECTIONS_PER_PEER,
             staked_nodes.clone(),
             MAX_STAKED_CONNECTIONS,
             MAX_UNSTAKED_CONNECTIONS,
-            MAX_STREAMS_PER_MS,
+            StakedStreamLoadEMAArgs {
+                max_streams_per_ms: 1,
+                stream_throttling_interval_ms: 1000,
+            },
             DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
             // Streams will be kept alive for 300s (5min) if no data is sent.
             Duration::from_secs(300),
             DEFAULT_TPU_COALESCE,
+            true,
         )
         .unwrap();
 
@@ -120,11 +126,15 @@ impl P3Quic {
             staked_nodes.clone(),
             MAX_STAKED_CONNECTIONS,
             MAX_UNSTAKED_CONNECTIONS,
-            MAX_STREAMS_PER_MS,
+            StakedStreamLoadEMAArgs {
+                max_streams_per_ms: 1,
+                stream_throttling_interval_ms: 1000,
+            },
             DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
             // Streams will be kept alive for 300s (5min) if no data is sent.
             Duration::from_secs(300),
             DEFAULT_TPU_COALESCE,
+            true,
         )
         .unwrap();
 
@@ -138,6 +148,7 @@ impl P3Quic {
             staked_nodes_last_update: Instant::now(),
             poh_recorder,
             staked_connection_table,
+            reg_packet_rx,
             mev_packet_rx,
             packet_tx,
 
@@ -166,13 +177,16 @@ impl P3Quic {
 
         while !self.exit.load(Ordering::Relaxed) {
             // Try to receive mev packets.
-            match self.mev_packet_rx.recv_timeout(
-                Duration::from_secs(1).saturating_sub(self.metrics_creation.elapsed()),
-            ) {
-                Ok(packets) => self.on_mev_packets(packets),
-                Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {}
-            };
+            crossbeam_channel::select_biased! {
+                recv(self.mev_packet_rx) -> res => match res {
+                    Ok(packets) => self.on_mev_packets(packets),
+                    Err(RecvError) => break,
+                },
+                recv(self.reg_packet_rx) -> res => match res {
+                    Ok(packets) => self.on_regular_packets(packets),
+                    Err(RecvError) => break,
+                }
+            }
 
             // Check if we need to report metrics for the last interval.
             let now = Instant::now();
@@ -204,16 +218,36 @@ impl P3Quic {
         self.quic_server_mev.join().unwrap();
     }
 
+    fn on_regular_packets(&mut self, mut packets: PacketBatch) {
+        let len = packets.len() as u64;
+        saturating_add_assign!(self.metrics.reg_forwarded, len);
+
+        for packet in packets.iter_mut() {
+            // NB: Unset the staked node flag to prevent forwarding.
+            packet.meta_mut().set_from_staked_node(false);
+        }
+
+        // Forward for verification & inclusion.
+        if let Err(TrySendError::Full(_)) = self.packet_tx.try_send(packets) {
+            saturating_add_assign!(self.metrics.reg_dropped, len)
+        }
+    }
+
     fn on_mev_packets(&mut self, mut packets: PacketBatch) {
+        let len = packets.len() as u64;
+        saturating_add_assign!(self.metrics.mev_forwarded, len);
+
         // Set drop on revert flag.
         for packet in packets.iter_mut() {
             packet.meta_mut().set_drop_on_revert(true);
+            // NB: Unset the staked node flag to prevent forwarding.
+            packet.meta_mut().set_from_staked_node(false);
         }
 
-        // TODO: Metrics.
-
         // Forward for verification & inclusion.
-        let _ = self.packet_tx.send(packets);
+        if let Err(TrySendError::Full(_)) = self.packet_tx.try_send(packets) {
+            saturating_add_assign!(self.metrics.mev_dropped, len)
+        }
     }
 
     fn update_staked_nodes(&mut self) {
@@ -235,11 +269,19 @@ impl P3Quic {
         };
 
         // Setup a new staked nodes map.
+        let mut stake_total = 0;
         let stakes = pool
             .entries
             .iter()
-            .take_while(|entry| entry.lockup != Pubkey::default())
-            .clone()
+            .take_while(|entry| {
+                stake_total += entry.amount;
+
+                // Take while lockup is initialized and the locked amount exceeds
+                // 1% of total stake.
+                entry.lockup != Pubkey::default()
+                    && entry.amount > 0
+                    && entry.amount * 100 / stake_total > 1
+            })
             .filter(|entry| entry.metadata != [0; 32])
             .map(|entry| (Pubkey::new_from_array(entry.metadata), entry.amount))
             .fold(
@@ -251,6 +293,7 @@ impl P3Quic {
                 },
             );
         let stakes = Arc::new(stakes);
+        debug!("Updated stakes; stakes={stakes:?}");
 
         // Swap the old for the new.
         *self.staked_nodes.write().unwrap() = StakedNodes::new(stakes.clone(), HashMap::default());
@@ -259,7 +302,7 @@ impl P3Quic {
         let connection_table_l = self.staked_connection_table.lock().unwrap();
         for connection in connection_table_l.table().values().flatten() {
             match connection.peer_type {
-                ConnectionPeerType::Staked(stake) => {
+                ConnectionPeerType::P3(stake) => {
                     if stakes
                         .get(&connection.identity)
                         .map_or(true, |connection_stake| connection_stake != &stake)
@@ -271,8 +314,8 @@ impl P3Quic {
                         connection.cancel.cancel();
                     }
                 }
-                ConnectionPeerType::Unstaked => {
-                    eprintln!("BUG: Unstaked connection in staked connection table");
+                ConnectionPeerType::Staked(_) | ConnectionPeerType::Unstaked => {
+                    eprintln!("BUG: Non-P3 connection in staked connection table");
                     connection.cancel.cancel();
                 }
             }
@@ -298,12 +341,14 @@ struct RateLimit {
 
 #[derive(Default, PartialEq, Eq)]
 struct P3Metrics {
-    /// Number of packets (transactions) received.
-    packets: u64,
-    /// Number of transactions dropped due to full channel.
-    dropped: u64,
-    /// Number of packets that failed to deserialize to a valid transaction.
-    err_deserialize: u64,
+    /// Number of regular packets forwarded.
+    reg_forwarded: u64,
+    /// Number of regular packets dropped.
+    reg_dropped: u64,
+    /// Number of mev packets forwarded.
+    mev_forwarded: u64,
+    /// Number of mev packets dropped.
+    mev_dropped: u64,
     /// Time taken to update staked nodes.
     staked_nodes_us: u64,
 }
@@ -318,9 +363,10 @@ impl P3Metrics {
         datapoint_info!(
             "p3_quic",
             ("age_ms", age_ms as i64, i64),
-            ("transactions", self.packets as i64, i64),
-            ("dropped", self.dropped as i64, i64),
-            ("err_deserialize", self.err_deserialize as i64, i64),
+            ("regular_packets_forwarded", self.reg_forwarded as i64, i64),
+            ("regular_packets_dropped", self.reg_dropped as i64, i64),
+            ("mev_packets_forwarded", self.mev_forwarded as i64, i64),
+            ("mev_packets_dropped", self.mev_dropped as i64, i64),
             ("staked_nodes_us", self.staked_nodes_us as i64, i64),
         );
     }

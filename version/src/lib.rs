@@ -77,8 +77,9 @@ impl Default for Version {
             patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
             commit: compute_commit(option_env!("CI_COMMIT")).unwrap_or_default(),
             feature_set,
+            // TODO: Set this to Paladin once desired.
             // Other client implementations need to modify this line.
-            client: u16::try_from(ClientId::Paladin).unwrap(),
+            client: u16::try_from(ClientId::JitoLabs).unwrap(),
         }
     }
 }

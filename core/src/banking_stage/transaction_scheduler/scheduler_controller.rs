@@ -34,12 +34,14 @@ use {
         address_lookup_table::state::estimate_last_valid_slot,
         clock::{Epoch, Slot, FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, MAX_PROCESSING_AGE},
         fee::FeeBudgetLimits,
+        pubkey::Pubkey,
         saturating_add_assign,
         transaction::SanitizedTransaction,
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_svm_transaction::svm_message::SVMMessage,
     std::{
+        collections::HashSet,
         sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
@@ -75,6 +77,7 @@ where
     worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     /// State for forwarding packets to the leader, if enabled.
     forwarder: Option<Forwarder<C>>,
+    blacklisted_accounts: HashSet<Pubkey>,
     batch: Vec<ImmutableDeserializedPacket>,
     batch_start: Instant,
     batch_interval: Duration,
@@ -92,6 +95,7 @@ where
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
         forwarder: Option<Forwarder<C>>,
+        blacklisted_accounts: HashSet<Pubkey>,
         batch_interval: Duration,
     ) -> Self {
         Self {
@@ -106,6 +110,7 @@ where
             timing_metrics: SchedulerTimingMetrics::default(),
             worker_metrics,
             forwarder,
+            blacklisted_accounts,
             batch: Vec::default(),
             batch_start: Instant::now(),
             batch_interval,
@@ -194,7 +199,7 @@ where
                             MAX_PROCESSING_AGE,
                         )
                     },
-                    |_| true // no pre-lock filter for now
+                    |tx| { pre_lock_filter(tx, &self.blacklisted_accounts) }
                 )?);
 
                 self.count_metrics.update(|count_metrics| {
@@ -735,6 +740,13 @@ where
     }
 }
 
+fn pre_lock_filter(tx: &SanitizedTransaction, blacklisted_accounts: &HashSet<Pubkey>) -> bool {
+    !tx.message()
+        .account_keys()
+        .iter()
+        .any(|a| blacklisted_accounts.contains(a))
+}
+
 /// Given the epoch, the minimum deactivation slot, and the current slot,
 /// return the `MaxAge` that should be used for the transaction. This is used
 /// to determine the maximum slot that a transaction will be considered valid
@@ -871,6 +883,7 @@ mod tests {
             PrioGraphScheduler::new(consume_work_senders, finished_consume_work_receiver),
             vec![], // no actual workers with metrics to report, this can be empty
             None,
+            HashSet::default(),
             Duration::from_millis(0),
         );
 
